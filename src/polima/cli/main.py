@@ -1,0 +1,136 @@
+"""`polima` -- one CLI for training, compiling, deploying and running robot
+policies on SiMa.ai Modalix.
+
+Mirrors LLiMa's shape (llima-compile / llima-deploy / llima-run) as subcommands:
+
+    polima train    --policy act --dataset rcwb_f_t
+    polima compile  --policy act --checkpoint <path>
+    polima deploy   --bundle <id> --board sima@192.168.91.211
+    polima run      --bundle <id> --fixture
+    polima robot    teleop | doctor | ports | preview | install | run
+    polima doctor
+    polima data     validate <roots...>
+    polima list
+
+Subcommand modules are imported lazily so `polima doctor` still works in an
+environment where, say, torch or afe is missing -- which is exactly the
+situation doctor exists to diagnose.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib
+import sys
+
+from polima import role
+from polima.util.logging import setup
+
+#: subcommand -> (module, help). Modules are imported only when invoked, so
+#: `polima doctor` still works in an environment missing torch or afe -- which
+#: is exactly the situation doctor exists to diagnose.
+#: Where each stage runs: see polima.role.HOST_COMMANDS / BOARD_COMMANDS.
+COMMANDS = {
+    "doctor": ("polima.cli.doctor", "diagnose the environment (host, compiler venv, board)"),
+    "data": ("polima.cli.data", "inspect, validate and combine datasets"),
+    "list": ("polima.cli.list_cmd", "list registered policies"),
+    "train": ("polima.cli.train", "train a policy"),
+    "compile": ("polima.cli.compile", "export, quantize and compile a policy to MLA ELFs"),
+    "deploy": ("polima.cli.deploy", "push a bundle to a Modalix board and start it"),
+    "run": ("polima.cli.run", "run inference against a deployed bundle"),
+    "robot": ("polima.cli.robot", "robot control: teleop, diagnostics, live view"),
+}
+
+_NOT_YET = {
+    "train": "Phase 1c",
+    "compile": "Phase 1b",
+    "deploy": "Phase 1a",
+    "run": "Phase 1a",
+    "robot": "Phase 1d",
+}
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="polima",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="COMMANDS:\n"
+        + "\n".join(f"  {name:9s} {help_text}" for name, (_, help_text) in COMMANDS.items()),
+    )
+    parser.add_argument("--config", metavar="FILE", help="extra config file, highest file layer")
+    parser.add_argument("--log-level", default=None, help="DEBUG, INFO, WARNING, ERROR")
+    parser.add_argument(
+        "--dry-run", action="store_true", help="print what would run without doing it"
+    )
+    parser.add_argument("--version", action="store_true", help="print the PoLiMa version and exit")
+    parser.add_argument("command", nargs="?", choices=list(COMMANDS), help=argparse.SUPPRESS)
+    return parser
+
+
+def split_argv(argv: list[str]) -> tuple[list[str], str | None, list[str]]:
+    """Split at the first recognised command name.
+
+    argparse's REMAINDER cannot do this: it stops capturing at a leading
+    `--flag`, so `polima list --graphs` would try to parse --graphs globally.
+    Splitting by hand lets every subcommand own its own flag namespace, which is
+    what makes `polima data validate --json` and `polima doctor --json` independent.
+    """
+    for index, token in enumerate(argv):
+        if token in COMMANDS:
+            return argv[:index], token, argv[index + 1:]
+    return argv, None, []
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(argv if argv is not None else sys.argv[1:])
+    globals_argv, command, rest = split_argv(argv)
+
+    parser = build_parser()
+    args = parser.parse_args(globals_argv)
+    args.command = command
+
+    if args.version:
+        print(f"polima {_version()}")
+        return 0
+    if not command:
+        parser.print_help()
+        return 1
+
+    setup(args.log_level)
+
+    module_name, _ = COMMANDS[command]
+    try:
+        module = importlib.import_module(module_name)
+    except ImportError as exc:
+        phase = _NOT_YET.get(command)
+        if phase:
+            print(
+                f"polima {command}: not implemented yet (planned for {phase}).\n"
+                f"Until then use the legacy scripts under "
+                f"{'ACT/' if command != 'robot' else 'lerobot_sima/'}.",
+                file=sys.stderr,
+            )
+            return 2
+        print(f"polima {command}: cannot load {module_name}: {exc}", file=sys.stderr)
+        return 2
+
+    denial = role.check(command, rest, module)
+    if denial:
+        print(f"polima {command}: {denial}", file=sys.stderr)
+        return 3
+
+    return module.run(rest, parent=args)
+
+
+def _version() -> str:
+    try:
+        from importlib.metadata import version
+
+        return version("polima")
+    except Exception:  # noqa: BLE001
+        return "0.1.0+src"
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

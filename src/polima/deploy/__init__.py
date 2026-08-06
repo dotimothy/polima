@@ -1,0 +1,150 @@
+"""Deploy a bundle to a Modalix board.
+
+Generalizes ACT/scripts/compile_deploy_act_som.sh (104 lines) and
+SmolVLA/scripts/compile_deploy_smolvla_som.sh (168), which perform the same
+ordered sequence written twice.
+
+Every stage is individually skippable and individually recorded, so a failed
+deploy says which step failed rather than leaving the board half-updated with a
+shell script's exit code as the only evidence.
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass, field
+
+from polima.bundle.layout import Bundle
+from polima.config.base import BoardConfig
+from polima.deploy import board as board_ops
+from polima.deploy.build import BuildResult, build_native
+from polima.deploy.service import ServiceStatus, start
+from polima.deploy.ssh import BoardError, BoardSession
+from polima.util.logging import get
+
+log = get("deploy")
+
+STAGES = (
+    "preflight", "layout", "sync-bundle", "build", "verify", "guard",
+    "activate", "service", "smoke",
+)
+
+
+@dataclass
+class DeployReport:
+    bundle_id: str
+    host: str
+    port: int
+    stages: dict = field(default_factory=dict)
+    build: BuildResult | None = None
+    service: ServiceStatus | None = None
+    started_at: float = 0.0
+    duration_s: float = 0.0
+    ok: bool = True
+
+    def record(self, stage: str, status: str, **detail) -> None:
+        self.stages[stage] = {"status": status, **detail}
+        if status == "failed":
+            self.ok = False
+
+    def to_dict(self) -> dict:
+        return {
+            "ok": self.ok, "bundle_id": self.bundle_id, "host": self.host,
+            "port": self.port, "stages": self.stages,
+            "build": self.build.to_dict() if self.build else None,
+            "service": self.service.to_dict() if self.service else None,
+            "duration_s": round(self.duration_s, 2),
+        }
+
+
+def deploy(
+    bundle: Bundle,
+    board_config: BoardConfig,
+    *,
+    port: int | None = None,
+    build: bool = True,
+    start_service: bool = True,
+    activate: bool = True,
+    force: bool = False,
+    verbose_server: bool = False,
+    dry_run: bool = False,
+) -> DeployReport:
+    """Push `bundle` to the board and (optionally) serve it."""
+    resolved_port = port or board_config.port or 0
+    report = DeployReport(
+        bundle_id=bundle.bundle_id, host=board_config.host, port=resolved_port,
+        started_at=time.time(),
+    )
+    remote_bundle = board_config.path("bundles", bundle.bundle_id)
+
+    with BoardSession(board_config, dry_run=dry_run) as session:
+        # --- preflight: fail before transferring 100+ MiB ------------------
+        checks = board_ops.preflight(session, board_config, bundle)
+        report.record("preflight", "ok" if checks.ok else "failed", **checks.to_dict())
+        if not checks.ok:
+            raise BoardError(
+                "board preflight failed:\n  " + "\n  ".join(checks.problems)
+            )
+        log.info(
+            "board %s: %s, %d cores, %.0f GB free",
+            board_config.host, checks.machine, checks.cores, checks.free_bytes / 1e9,
+        )
+
+        board_ops.ensure_layout(session, board_config)
+        report.record("layout", "ok")
+
+        # --- sync: content-addressed, so an identical bundle is a no-op ----
+        already = session.exists(f"{remote_bundle}/bundle.json")
+        if already and not force:
+            log.info("bundle %s already on the board; skipping transfer", bundle.bundle_id)
+            report.record("sync-bundle", "skipped", reason="already present")
+        else:
+            log.info("syncing %.1f MiB to %s", bundle.total_elf_bytes / 1048576, remote_bundle)
+            session.mkdirs(remote_bundle)
+            session.rsync(
+                bundle.root, remote_bundle, delete=True,
+                excludes=("*.tar.gz", "*.onnx", "__pycache__"), echo=False,
+            )
+            report.record("sync-bundle", "ok", bytes=bundle.total_elf_bytes)
+
+        # --- build: skipped when native/ is unchanged ----------------------
+        if build:
+            result = build_native(session, board_config, force=force)
+            report.build = result
+            report.record(
+                "build", "skipped" if result.skipped else "ok", source_hash=result.source_hash
+            )
+        else:
+            report.record("build", "skipped", reason="--no-build")
+
+        # --- verify: hash every ELF on the board ---------------------------
+        problems = board_ops.verify_bundle(session, board_config, bundle)
+        report.record("verify", "ok" if not problems else "failed", problems=problems)
+        if problems:
+            raise BoardError("bundle verification failed:\n  " + "\n  ".join(problems))
+
+        board_ops.assert_no_archives(session, remote_bundle)
+        report.record("guard", "ok")
+
+        if activate:
+            board_ops.activate(session, board_config, bundle.bundle_id)
+            report.record("activate", "ok", current=bundle.bundle_id)
+        else:
+            report.record("activate", "skipped")
+
+        # --- service -------------------------------------------------------
+        if start_service:
+            if not resolved_port:
+                raise BoardError("no port given and the board config declares none")
+            status = start(
+                session, board_config, port=resolved_port,
+                bundle_path=board_config.current_link if activate else remote_bundle,
+                verbose=verbose_server,
+            )
+            report.service = status
+            report.record("service", "ok", pid=status.pid, port=resolved_port)
+        else:
+            report.record("service", "skipped", reason="--no-start")
+
+    report.duration_s = time.time() - report.started_at
+    return report

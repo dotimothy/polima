@@ -1,0 +1,21 @@
+# Build / install artifacts
+*.egg-info/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+
+# PoLiMa outputs -- bundles, ONNX, ELFs and checkpoints are content-addressed
+# build products, never source.
+outputs/
+*.onnx
+*.elf
+*.f32
+*.npz
+*_mpk.tar.gz
+
+# Local site config (board address etc.); .polima.yaml.example is tracked.
+.polima.yaml
+.polima.json
