@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from polima.bundle.layout import Bundle
 from polima.config.base import BoardConfig
 from polima.deploy import board as board_ops
-from polima.deploy.build import BuildResult, build_native
+from polima.deploy.build import BuildResult, build_native, link_onto_path
 from polima.deploy.service import ServiceStatus, start
 from polima.deploy.ssh import BoardError, BoardSession
 from polima.util.logging import get
@@ -75,7 +75,7 @@ def deploy(
         bundle_id=bundle.bundle_id, host=board_config.host, port=resolved_port,
         started_at=time.time(),
     )
-    remote_bundle = board_config.path("bundles", bundle.bundle_id)
+    remote_bundle = f"{board_config.bundles_dir}/{bundle.bundle_id}"
 
     with BoardSession(board_config, dry_run=dry_run) as session:
         # --- preflight: fail before transferring 100+ MiB ------------------
@@ -113,6 +113,14 @@ def deploy(
             report.build = result
             report.record(
                 "build", "skipped" if result.skipped else "ok", source_hash=result.source_hash
+            )
+            # Put the binaries on PATH, the way /usr/bin/llima already is. Best
+            # effort: an alias is a convenience and must never fail a deploy.
+            aliases = link_onto_path(session, board_config)
+            report.record(
+                "link-bins", "ok" if aliases else "skipped",
+                aliases=sorted(aliases),
+                reason="" if aliases else "no writable PATH directory (try sudo)",
             )
         else:
             report.record("build", "skipped", reason="--no-build")

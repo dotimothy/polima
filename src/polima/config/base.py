@@ -42,6 +42,12 @@ class BoardConfig:
     free_space_factor: float = 1.5
     health_timeout_s: float = 30.0
     connect_timeout_s: float = 10.0
+    #: Directory under `root` holding deployed model trees. `models` rather than
+    #: `bundles` so PoLiMa bundles sit alongside the hand-built deploy roots
+    #: already there (ACT_gewb_100000, SmolVLA_gewb_045000_v2, ...) instead of
+    #: creating a second place to look. Bundle names stay content-addressed, so
+    #: they cannot collide with the hand-named trees.
+    bundles_subdir: str = "models"
 
     @property
     def user(self) -> str:
@@ -56,7 +62,7 @@ class BoardConfig:
 
     @property
     def bundles_dir(self) -> str:
-        return self.path("bundles")
+        return self.path(self.bundles_subdir)
 
     @property
     def current_link(self) -> str:

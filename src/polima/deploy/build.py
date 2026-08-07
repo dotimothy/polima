@@ -103,6 +103,55 @@ def _link_binaries(session: BoardSession, board: BoardConfig, build_dir: str) ->
         )
 
 
+#: Alias -> binary, installed onto PATH. Dashes match the console scripts
+#: (`polima-run`, `polima-doctor`); the binaries keep their underscored names.
+PATH_ALIASES = {"polima-server": "polima_server", "polima-cli": "polima_cli"}
+
+#: Where LLiMa lives on the SoM (`/usr/bin/llima`), so this is the convention
+#: the devkit already follows. /usr/local/bin is preferred because it is ahead
+#: of /usr/bin on PATH and is not owned by a package.
+PATH_DIRS = ("/usr/local/bin", "/usr/bin")
+
+
+def link_onto_path(session: BoardSession, board: BoardConfig) -> dict[str, str]:
+    """Put `polima-server` / `polima-cli` on PATH, the way `llima` already is.
+
+    Without this the binaries sit in `/media/nvme/polima/bin`, which is on no
+    PATH, so every invocation needs the full path. LLiMa installs `/usr/bin/llima`
+    and is simply `llima` from any shell; matching that is the whole point.
+
+    The links point at `bin/<name>`, which is itself a symlink into the
+    content-hashed build tree. That indirection is deliberate: a rebuild moves
+    `bin/<name>` and the PATH alias follows automatically, so this never has to
+    run again.
+
+    Best-effort by design. A convenience alias must never fail a deploy, so a
+    directory that needs root is tried with `sudo -n` and skipped if that would
+    prompt. The caller reports what was linked and what was not.
+    """
+    linked: dict[str, str] = {}
+    for directory in PATH_DIRS:
+        if not session.run(f"test -d {shlex.quote(directory)}", check=False).returncode == 0:
+            continue
+        writable = session.run(f"test -w {shlex.quote(directory)}", check=False).returncode == 0
+        prefix = "" if writable else "sudo -n "
+        if not writable and session.run("sudo -n true", check=False).returncode != 0:
+            continue
+
+        for alias, binary in PATH_ALIASES.items():
+            target = board.path("bin", binary)
+            result = session.run(
+                f"{prefix}ln -sfn {shlex.quote(target)} "
+                f"{shlex.quote(directory + '/' + alias)}",
+                check=False,
+            )
+            if result.returncode == 0:
+                linked[alias] = f"{directory}/{alias}"
+        if linked:
+            break
+    return linked
+
+
 def prune_builds(session: BoardSession, board: BoardConfig, keep: int = 2) -> list[str]:
     """Drop old build trees, newest `keep` retained. Never touches `bin` links."""
     listing = session.capture(

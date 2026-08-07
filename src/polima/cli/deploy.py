@@ -94,6 +94,9 @@ def _detail(stage: str, info: dict) -> str:
         return f"{size / 1048576:.1f} MiB" if size else info.get("reason", "")
     if stage == "service":
         return f"pid {info.get('pid')} port {info.get('port')}"
+    if stage == "link-bins":
+        aliases = info.get("aliases") or []
+        return ", ".join(aliases) if aliases else info.get("reason", "")
     if info.get("problems"):
         return "; ".join(info["problems"])[:80]
     return info.get("reason", "")
@@ -103,11 +106,15 @@ def _manage(args, board, dry_run: bool) -> int:
     with BoardSession(board, dry_run=dry_run) as session:
         if args.list:
             current = board_ops.current_bundle(session, board)
+            managed = board_ops.managed_bundles(session, board)
             rows = [
-                [name, "<- current" if name == current else ""]
+                [name,
+                 "polima" if name in managed else "legacy tree",
+                 "<- current" if name == current else ""]
                 for name in board_ops.list_bundles(session, board)
             ]
-            print(table.render(rows, headers=["bundle", ""]) or "no bundles on the board")
+            print(table.render(rows, headers=["name", "kind", ""])
+                  or "nothing in the board's model store")
             return 0
 
         if args.stop:

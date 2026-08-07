@@ -26,9 +26,11 @@ from polima.deploy.smoke import (
 
 def test_board_paths():
     board = BoardConfig(root="/media/nvme/polima")
-    assert board.bundles_dir == "/media/nvme/polima/bundles"
+    # `models`, not `bundles`: PoLiMa deploys alongside the hand-built trees
+    # already on the board rather than creating a second place to look.
+    assert board.bundles_dir == "/media/nvme/polima/models"
     assert board.current_link == "/media/nvme/polima/current"
-    assert board.path("bundles", "abc") == "/media/nvme/polima/bundles/abc"
+    assert board.path("models", "abc") == "/media/nvme/polima/models/abc"
     assert board.path("var/log") == "/media/nvme/polima/var/log"
     assert board.bin_dir == "/media/nvme/polima/bin"
 
@@ -42,7 +44,12 @@ def test_board_address_and_user():
 
 def test_trailing_slashes_do_not_double_up():
     board = BoardConfig(root="/media/nvme/polima/")
-    assert board.path("bundles") == "/media/nvme/polima/bundles"
+    assert board.path("models") == "/media/nvme/polima/models"
+
+
+def test_deploy_directory_is_configurable():
+    """The board's model store is a layout choice, not a constant."""
+    assert BoardConfig(bundles_subdir="bundles").bundles_dir.endswith("/bundles")
 
 
 def test_default_build_jobs_is_not_the_legacy_two():

@@ -13,7 +13,7 @@ from polima.util.logging import get
 log = get("deploy.board")
 
 #: Directories every deploy expects to exist under BoardConfig.root.
-LAYOUT = ("bin", "src", "build", "bundles", "robot", "var/log", "var/run", "etc")
+LAYOUT = ("bin", "src", "build", "robot", "var/log", "var/run", "etc")
 
 
 @dataclass
@@ -93,7 +93,7 @@ def _probe(session: BoardSession, board: BoardConfig) -> dict[str, str]:
 
 
 def ensure_layout(session: BoardSession, board: BoardConfig) -> None:
-    session.mkdirs(*(board.path(part) for part in LAYOUT))
+    session.mkdirs(*(board.path(part) for part in LAYOUT), board.bundles_dir)
 
 
 def assert_no_archives(session: BoardSession, remote_dir: str) -> None:
@@ -120,7 +120,7 @@ def verify_bundle(session: BoardSession, board: BoardConfig, bundle: Bundle) -> 
     A truncated rsync produces an ELF that loads and returns garbage; comparing
     digests is the only way to rule that out.
     """
-    remote_root = board.path("bundles", bundle.bundle_id)
+    remote_root = f"{board.bundles_dir}/{bundle.bundle_id}"
     problems: list[str] = []
     commands = " ; ".join(
         f"sha256sum {shlex.quote(remote_root + '/' + artifact.elf)} 2>/dev/null || "
@@ -150,7 +150,7 @@ def verify_bundle(session: BoardSession, board: BoardConfig, bundle: Bundle) -> 
 
 def activate(session: BoardSession, board: BoardConfig, bundle_id: str) -> None:
     """Point `current` at a bundle. Atomic, so rollback needs no file transfer."""
-    target = board.path("bundles", bundle_id)
+    target = f"{board.bundles_dir}/{bundle_id}"
     session.run(f"ln -sfn {shlex.quote(target)} {shlex.quote(board.current_link)}")
     log.info("activated %s", bundle_id)
 
@@ -170,7 +170,25 @@ def current_bundle(session: BoardSession, board: BoardConfig) -> str | None:
 
 
 def list_bundles(session: BoardSession, board: BoardConfig) -> list[str]:
-    output = session.capture(
-        f"ls -1 {shlex.quote(board.bundles_dir)} 2>/dev/null"
-    )
+    output = session.capture(f"ls -1 {shlex.quote(board.bundles_dir)} 2>/dev/null")
     return [line for line in output.splitlines() if line.strip()]
+
+
+def managed_bundles(session: BoardSession, board: BoardConfig) -> set[str]:
+    """Of the trees in the model store, the ones PoLiMa built.
+
+    The store also holds hand-built deploy roots (ACT_gewb_100000,
+    SmolVLA_gewb_045000_v2, ...). Those are perfectly valid to serve, but
+    `--activate` and the content-hash guarantees only apply to trees carrying a
+    bundle.json, so the listing says which is which rather than implying every
+    directory is interchangeable.
+    """
+    found = session.capture(
+        f"find {shlex.quote(board.bundles_dir)} -maxdepth 2 -name bundle.json 2>/dev/null"
+    )
+    prefix = board.bundles_dir.rstrip("/") + "/"
+    return {
+        line[len(prefix):].split("/")[0]
+        for line in found.splitlines()
+        if line.startswith(prefix)
+    }

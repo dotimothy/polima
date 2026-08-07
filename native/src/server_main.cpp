@@ -53,6 +53,15 @@ double elapsed_ms(Clock::time_point start) {
 int main(int argc, char** argv) {
   try {
     polima::Args args(argc, argv);
+    if (args.has("--help") || args.has("-h")) {
+      std::cout <<
+        "polima-server -- serve a bundle over the policy's TCP wire protocol.\n\n"
+        "  --bundle DIR   bundle directory (e.g. /media/nvme/polima/current)\n"
+        "  --port N       listen port (default: the policy's wire port)\n"
+        "  --verbose      per-step timings on every request\n"
+        "  -h, --help     this message\n";
+      return 0;
+    }
     const std::string bundle = args.get("--bundle");
     const bool verbose = args.has("--verbose");
 

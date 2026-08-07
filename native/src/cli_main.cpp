@@ -25,6 +25,18 @@ namespace fs = std::filesystem;
 int main(int argc, char** argv) {
   try {
     polima::Args args(argc, argv);
+    if (args.has("--help") || args.has("-h")) {
+      std::cout <<
+        "polima-cli -- run a bundle once, files in, files out.\n\n"
+        "  --bundle DIR        bundle directory (e.g. /media/nvme/polima/current)\n"
+        "  --input-dir DIR     one <tensor>.f32 per wire input\n"
+        "                      (default: <bundle>/fixtures/inputs)\n"
+        "  --output FILE       write the result as float32\n"
+        "  --dump-stages DIR   write every intermediate buffer, for bisecting\n"
+        "  --verbose           per-step timings\n"
+        "  -h, --help          this message\n";
+      return 0;
+    }
     const fs::path bundle = args.get("--bundle");
     const bool verbose = args.has("--verbose");
 
