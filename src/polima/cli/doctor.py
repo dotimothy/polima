@@ -100,6 +100,7 @@ def run(argv: list[str], parent: argparse.Namespace | None = None) -> int:
     if everything or only_imports:
         check_import_matrix(doc, config)
     if everything:
+        check_lerobot_patches(doc)
         check_compiler(doc, config)
         check_policies(doc)
         check_datasets(doc, config)
@@ -192,14 +193,22 @@ def check_repo(doc: Doctor) -> None:
     )
 
     root = repo_root()
-    doc.record(
-        table.WARN if not (root / ".git").exists() else table.OK,
-        "version control",
-        "MLSandbox is not a git repo (planned for Phase 2); "
-        "`make check-legacy-intact` is the regression guard until then"
-        if not (root / ".git").exists()
-        else "git present",
-    )
+    if (root / ".git").exists():
+        head = _capture(["git", "-C", str(root), "log", "-1", "--format=%h %s"]).strip()
+        dirty = len([
+            line for line in
+            _capture(["git", "-C", str(root), "status", "--porcelain"]).splitlines()
+            if line.strip()
+        ])
+        doc.record(
+            table.OK, "version control",
+            f"{head[:60]}" + (f"  ({dirty} uncommitted)" if dirty else "  (clean)"),
+        )
+    else:
+        doc.record(
+            table.WARN, "version control",
+            "MLSandbox is not a git repo; `make check-legacy-intact` is the only guard",
+        )
 
     manifest = root / "polima" / "tests" / "fixtures" / "legacy_manifest.txt"
     if manifest.is_file():
@@ -253,6 +262,40 @@ def check_repo(doc: Doctor) -> None:
 
 
 # -------------------------------------------------------------- import matrix
+
+
+#: The three local lerobot edits, checked by the symbol each introduces rather
+#: than by applying a patch. ACT/lerobot and SmolVLA/lerobot implement the same
+#: features with different formatting, so a textual patch match false-alarms on
+#: SmolVLA. See polima/patches/README.md.
+LEROBOT_FEATURES = (
+    ("server-selected checkpoint",
+     "src/lerobot/async_inference/configs.py", "pretrained_name_or_path"),
+    ("server honours it",
+     "src/lerobot/async_inference/policy_server.py", "pretrained_name_or_path"),
+    ("non-interactive calibration",
+     "src/lerobot/robots/so_follower/so_follower.py",
+     "LEROBOT_FORCE_PROVIDED_CALIBRATION"),
+)
+
+
+def check_lerobot_patches(doc: Doctor) -> None:
+    doc.heading("lerobot local modifications")
+    root = repo_root()
+    for clone in LEROBOT_CLONES:
+        base = root / clone
+        if not base.is_dir():
+            doc.record(table.SKIP, clone, "absent")
+            continue
+        missing = [
+            label for label, relative, symbol in LEROBOT_FEATURES
+            if symbol not in (base / relative).read_text(errors="replace")
+        ] if all((base / rel).is_file() for _, rel, _ in LEROBOT_FEATURES) else ["file missing"]
+        doc.record(
+            table.OK if not missing else table.FAIL, clone,
+            f"all {len(LEROBOT_FEATURES)} local features present"
+            if not missing else "MISSING: " + ", ".join(missing),
+        )
 
 
 def check_import_matrix(doc: Doctor, config) -> None:
