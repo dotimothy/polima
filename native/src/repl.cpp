@@ -18,6 +18,7 @@
 
 #include "polima/lineedit.hpp"
 #include "polima/plan.hpp"
+#include "polima/robot.hpp"
 #include "polima/service.hpp"
 #include "polima/socket.hpp"
 
@@ -118,6 +119,7 @@ void print_help() {
       "  info                what is loaded: graphs, buffers, wire\n"
       "  unload              free the model, and stop the server holding the MLA\n"
       "  server [stop|start] show or control polima_server\n"
+      "  robot               arm and cameras for the loaded bundle\n"
       "  save <file>         write the last result as float32\n"
       "  help, quit\n"
       "\n  arrows for history and cursor, tab to complete, Ctrl-C to abandon\n"
@@ -198,8 +200,8 @@ int repl(const fs::path& store, const std::string& preselect, bool verbose) {
   install_interrupt_handler();
   LineEditor editor;
   const std::vector<std::string> commands = {
-      "models", "use", "unload", "server", "run", "bench", "stages", "check",
-      "info", "save", "help", "quit"};
+      "models", "use", "unload", "server", "robot", "run", "bench", "stages",
+      "check", "info", "save", "help", "quit"};
   auto refresh_completions = [&]() {
     std::vector<std::string> words = commands;
     for (const auto& entry : entries)
@@ -348,6 +350,40 @@ int repl(const fs::path& store, const std::string& preselect, bool verbose) {
         } else {
           std::cout << "  usage: server [stop|start]\n";
         }
+        continue;
+      }
+
+      if (command == "robot") {
+        if (loaded.empty()) {
+          std::cout << "  `use <n>` first -- the camera roles come from the "
+                       "bundle's plan.json\n";
+          continue;
+        }
+        const auto description = read_robot_description(store / loaded);
+        if (!description.present) {
+          std::cout << "  this bundle predates the robot description; repack it "
+                       "with `polima compile`\n";
+          continue;
+        }
+        const auto cameras = list_cameras();
+        const auto ports = list_serial_ports();
+        const auto assignment = assign_cameras(description, cameras);
+
+        std::cout << "  arm       "
+                  << (ports.empty() ? "none (expected /dev/ttyACM*)" : ports.front());
+        if (ports.size() > 1) std::cout << "  (" << ports.size() << " present)";
+        std::cout << "\n";
+        for (const auto& [role, label] : description.roles) {
+          const auto found = assignment.assigned.find(role);
+          std::cout << "  " << std::left << std::setw(10) << role
+                    << (found == assignment.assigned.end() ? "unassigned" : found->second)
+                    << "\n";
+        }
+        std::cout << "  fps       " << description.fps << ", " << description.fourcc << "\n";
+        for (const auto& problem : assignment.problems)
+          std::cout << "  ! " << problem << "\n";
+        if (cameras.empty() && ports.empty())
+          std::cout << "  nothing attached to this board\n";
         continue;
       }
 

@@ -164,6 +164,21 @@ def _plan_dict(plan: RuntimePlan, wire: PolicySpec | None = None) -> dict:
             "response_shape": list(wire.wire.response_shape),
             "response_elements": wire.wire.response_elements,
         }
+        # The robot description crosses to the board too. Without it the board
+        # would need the Python PolicySpec just to learn that the wrist camera
+        # is the Sonix one -- and the board deliberately has no polima Python.
+        robot = wire.robot
+        data["robot"] = {
+            "camera_roles": [list(pair) for pair in robot.camera_roles],
+            "camera_hints": dict(robot.camera_hints),
+            "camera_fourcc": robot.camera_fourcc,
+            "joint_names": list(robot.joint_names),
+            "actions_per_chunk": robot.actions_per_chunk,
+            "fps": robot.default_fps,
+            "max_relative_target": robot.max_relative_target,
+            "aggregate_fn": robot.aggregate_fn,
+            "calibration_id": robot.calibration_id,
+        }
     return data
 
 

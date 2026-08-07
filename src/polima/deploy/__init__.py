@@ -57,6 +57,27 @@ class DeployReport:
         }
 
 
+def _metadata_matches(session, bundle, remote_bundle: str) -> bool:
+    """Whether the board's copy of the non-ELF files is current.
+
+    ELF identity is guaranteed by the bundle id; everything else is not.
+    """
+    import hashlib
+
+    for name in ("plan.json", "bundle.json"):
+        local = bundle.root / name
+        if not local.is_file():
+            continue
+        expected = hashlib.sha256(local.read_bytes()).hexdigest()
+        actual = session.capture(
+            f"sha256sum {remote_bundle}/{name} 2>/dev/null | cut -d' ' -f1"
+        ).strip()
+        if actual != expected:
+            log.info("%s differs from the board's copy; re-syncing", name)
+            return False
+    return True
+
+
 def deploy(
     bundle: Bundle,
     board_config: BoardConfig,
@@ -93,8 +114,15 @@ def deploy(
         board_ops.ensure_layout(session, board_config)
         report.record("layout", "ok")
 
-        # --- sync: content-addressed, so an identical bundle is a no-op ----
-        already = session.exists(f"{remote_bundle}/bundle.json")
+        # --- sync: content-addressed on the ELFs, so an identical bundle is
+        # a no-op. But the id covers ELFs ONLY: plan.json, the wire description
+        # and the fixtures can all change without moving it, and skipping on
+        # "the directory exists" meant an edited plan silently never reached the
+        # board. rsync is cheap when the ELFs match, so compare the small files
+        # and let rsync decide about the big ones.
+        already = session.exists(f"{remote_bundle}/bundle.json") and _metadata_matches(
+            session, bundle, remote_bundle
+        )
         if already and not force:
             log.info("bundle %s already on the board; skipping transfer", bundle.bundle_id)
             report.record("sync-bundle", "skipped", reason="already present")
