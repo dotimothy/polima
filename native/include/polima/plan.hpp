@@ -15,8 +15,9 @@
 //   run_elf        padded <- decoder_action_tail(hidden)
 //   gather_strided actions<- padded stride 16 take 6 count 100
 //
-// ACT needs exactly three opcodes. SmolVLA (Phase 4) adds six more; they are
-// declared in the enum now so the dispatch is exhaustive from the start.
+// ACT needs exactly three opcodes: run_elf, pack, gather_strided. SmolVLA uses
+// all ten, including a 10-iteration flow-matching loop that the plan emits
+// unrolled -- so the interpreter still has no control flow of its own.
 #pragma once
 
 #include <nlohmann/json.hpp>
@@ -52,6 +53,11 @@ struct PackPart {
   std::string source;
   size_t destination_offset = 0;
   size_t count = 0;
+  // Read from a constants/ sidecar rather than a plan buffer. SmolVLA's prefix
+  // is built from two of these -- the empty-image and language embeddings are
+  // fixed for a checkpoint, so they ship with the bundle instead of being
+  // recomputed or sent over the wire every inference.
+  bool sidecar = false;
 };
 
 struct Step {
@@ -62,11 +68,16 @@ struct Step {
   std::vector<std::string> inputs;   // args["in"]  -- run_elf and friends
   std::vector<PackPart> parts;       // pack
   size_t offset = 0;                 // slice
-  size_t stride = 0;                 // gather_strided
+  size_t stride = 0;                 // gather_strided: source stride; 0 broadcasts
   size_t take = 0;
+  size_t destination_stride = 0;     // gather_strided: defaults to `take`
+  size_t destination_offset = 0;
+  bool clear = false;                // zero the output before scattering
   size_t count = 0;
   size_t size = 0;
-  float scalar = 0.0f;               // scale
+  float scalar = 0.0f;               // scale, euler dt, sincos timestep
+  float min_period = 0.0f;           // sincos_time
+  float max_period = 0.0f;
   std::string weights;               // matvec / normalize
   std::string bias;
   std::string mean;

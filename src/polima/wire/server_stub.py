@@ -113,7 +113,10 @@ class StubPlan:
             for part in args["parts"]:
                 start = part["dst_offset"]
                 count = part["count"]
-                packed[start:start + count] = state[part["src"]][:count]
+                # A part reads either a live buffer or a constants/ sidecar.
+                origin = (self._constant(part["src"]) if part.get("sidecar")
+                          else state[part["src"]])
+                packed[start:start + count] = origin[:count]
             state[step["out"]] = packed
 
         elif op == "slice":
@@ -122,9 +125,21 @@ class StubPlan:
             state[step["out"]] = source()[offset:offset + count].copy()
 
         elif op == "gather_strided":
+            # Scatter as well as gather: dst_stride defaults to `take` (ACT's
+            # contiguous case) and a source stride of 0 broadcasts one span into
+            # every block, which is how SmolVLA's shared time embedding reaches
+            # all 50 action tokens.
             stride, take, count = args["stride"], args["take"], args["count"]
-            block = source()[: count * stride].reshape(count, stride)
-            state[step["out"]] = block[:, :take].reshape(-1).copy()
+            dst_stride = args.get("dst_stride") or take
+            dst_offset = args.get("dst_offset", 0)
+            values = source()
+            target = (np.zeros(out.size, dtype=np.float32) if args.get("clear")
+                      else out.copy())
+            for index in range(count):
+                read_at = index * stride
+                write_at = index * dst_stride + dst_offset
+                target[write_at:write_at + take] = values[read_at:read_at + take]
+            state[step["out"]] = target
 
         elif op == "scale":
             state[step["out"]] = source() * np.float32(args["scalar"])
@@ -140,12 +155,19 @@ class StubPlan:
             state[step["out"]] = result.astype(np.float32)
 
         elif op == "sincos_time":
-            t = np.float32(args["scalar"])
+            # period = min * (max/min)^(i/(half-1)); angle = t * 2pi/period.
+            # The exponent divides by half-1 so the last entry lands exactly on
+            # max_period, and the 2pi belongs in the angle -- both are easy to
+            # get subtly wrong and neither raises when wrong.
+            timestep = np.float32(args["scalar"])
             half = out.size // 2
-            index = np.arange(half, dtype=np.float32)
-            period = np.power(np.float32(10000.0), index / max(half, 1))
+            min_period = np.float32(args.get("min_period") or 1.0)
+            max_period = np.float32(args.get("max_period") or min_period)
+            fraction = np.arange(half, dtype=np.float32) / np.float32(max(half - 1, 1))
+            period = min_period * np.power(max_period / min_period, fraction)
+            angle = timestep * (np.float32(2.0 * np.pi) / period)
             state[step["out"]] = np.concatenate(
-                [np.sin(t / period), np.cos(t / period)]
+                [np.sin(angle), np.cos(angle)]
             ).astype(np.float32)
 
         elif op == "euler":

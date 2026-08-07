@@ -124,13 +124,19 @@ Plan::Plan(const std::filesystem::path& bundle_root, bool verbose)
       for (const auto& part : args.at("parts"))
         step.parts.push_back({part.at("src").get<std::string>(),
                               part.at("dst_offset").get<size_t>(),
-                              part.at("count").get<size_t>()});
+                              part.at("count").get<size_t>(),
+                              part.value("sidecar", false)});
     step.offset = args.value("offset", size_t{0});
     step.stride = args.value("stride", size_t{0});
     step.take = args.value("take", size_t{0});
     step.count = args.value("count", size_t{0});
     step.size = args.value("size", size_t{0});
+    step.destination_stride = args.value("dst_stride", size_t{0});
+    step.destination_offset = args.value("dst_offset", size_t{0});
+    step.clear = args.value("clear", false);
     step.scalar = args.value("scalar", 0.0f);
+    step.min_period = args.value("min_period", 0.0f);
+    step.max_period = args.value("max_period", 0.0f);
     step.weights = args.value("weights", std::string{});
     step.bias = args.value("bias", std::string{});
     step.mean = args.value("mean", std::string{});
@@ -148,7 +154,7 @@ Plan::Plan(const std::filesystem::path& bundle_root, bool verbose)
     if (!step.source.empty() && !buffer_sizes_.count(step.source))
       throw std::runtime_error("step reads undeclared buffer '" + step.source + "'");
     for (const auto& part : step.parts)
-      if (!buffer_sizes_.count(part.source))
+      if (!part.sidecar && !buffer_sizes_.count(part.source))
         throw std::runtime_error("pack part reads undeclared buffer '" + part.source + "'");
 
     steps_.push_back(std::move(step));
@@ -201,7 +207,11 @@ void Plan::run_step(const Step& step) {
       // from torch.zeros).
       std::fill(out.begin(), out.end(), 0.0f);
       for (const auto& part : step.parts) {
-        const auto& source = buffer(part.source);
+        // A part comes either from a live buffer or from a constants/ sidecar.
+        // SmolVLA's prefix needs both: two of its five sections are fixed for a
+        // checkpoint (the empty-image and language embeddings), so they ship
+        // with the bundle instead of crossing the wire every inference.
+        const auto& source = part.sidecar ? sidecars_.get(part.source) : buffer(part.source);
         if (part.destination_offset + part.count > out.size())
           throw std::runtime_error("pack part overruns buffer '" + step.out + "'");
         if (part.count > source.size())
@@ -224,10 +234,18 @@ void Plan::run_step(const Step& step) {
       // ACT's 16 -> 6 unpad: DecoderActionRank4 widens the action head to 16
       // output channels for MLA channel alignment and zero-fills the rest, so
       // the host takes 6 of every 16 values, 100 times.
+      //
+      // SmolVLA needs the scatter direction too, so the destination stride is
+      // configurable and defaults to `take` (which is ACT's contiguous case).
+      // A source stride of 0 broadcasts one span into every block, which is how
+      // the shared 720-wide time embedding reaches all 50 action tokens.
       const auto& source = read_buffer(step);
+      const size_t destination_stride = step.destination_stride ? step.destination_stride
+                                                                : step.take;
+      if (step.clear) std::fill(out.begin(), out.end(), 0.0f);
       for (size_t index = 0; index < step.count; ++index) {
         const size_t read_at = index * step.stride;
-        const size_t write_at = index * step.take;
+        const size_t write_at = index * destination_stride + step.destination_offset;
         if (read_at + step.take > source.size() || write_at + step.take > out.size())
           throw std::runtime_error("gather_strided overruns on step " + step.raw);
         std::copy_n(source.begin() + read_at, step.take, out.begin() + write_at);
@@ -256,13 +274,28 @@ void Plan::run_step(const Step& step) {
     }
 
     case Opcode::SincosTime: {
+      // Geometric period sweep from min_period to max_period, as an angular
+      // frequency: period = min * (max/min)^(i/(half-1)), angle = t * 2pi/period.
+      //
+      // Transcribed from smolvla_som_server.cpp::make_suffix_input. The details
+      // matter and are easy to get subtly wrong: the exponent divides by
+      // half-1 (so the last entry lands exactly on max_period, not one step
+      // short), and the angle carries the 2pi. Getting either wrong yields a
+      // plausible-looking embedding and a policy that acts at the wrong phase
+      // of the denoising schedule.
       const float t = step.scalar;
       const size_t half = out.size() / 2;
+      if (half == 0) break;
+      const float min_period = step.min_period > 0.0f ? step.min_period : 1.0f;
+      const float max_period = step.max_period > 0.0f ? step.max_period : min_period;
+      const float span = max_period / min_period;
+      const float divisor = half > 1 ? static_cast<float>(half - 1) : 1.0f;
       for (size_t index = 0; index < half; ++index) {
-        const float period = std::pow(10000.0f, static_cast<float>(index) /
-                                                    static_cast<float>(half ? half : 1));
-        out[index] = std::sin(t / period);
-        out[half + index] = std::cos(t / period);
+        const float fraction = static_cast<float>(index) / divisor;
+        const float period = min_period * std::pow(span, fraction);
+        const float angle = t * (2.0f * static_cast<float>(M_PI) / period);
+        out[index] = std::sin(angle);
+        out[half + index] = std::cos(angle);
       }
       break;
     }
