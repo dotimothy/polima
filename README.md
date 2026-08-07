@@ -14,12 +14,16 @@ Adding a policy should mean writing one `PolicySpec`, not copying 3,000 lines.
 
 PoLiMa spans two machines with incompatible dependency sets. That split is structural, not a convention.
 
+**The host builds; the board runs.** Nothing on the host drives a robot, and nothing on the board compiles.
+
 | | **HOST** (x86_64 workstation) | **BOARD** (Modalix SoM, aarch64) |
 |---|---|---|
-| | `polima-compile` — export (torch, lerobot) then compile (afe, onnx) | `polima` — umbrella |
-| | | `polima-run` — inference |
-| | `polima-deploy` — ssh, rsync | `polima-robot` — teleop, live view |
-| deps | `polima[host]` | `polima` (numpy only) or `polima[robot]` |
+| role | build it | run it |
+| | `polima-compile` — export (torch) then compile (afe), two separate venvs | `polima-run` — serve the policy |
+| | `polima-deploy` — ssh, rsync | `polima-robot` — drive the arm |
+| deps | `polima[host]` | `polima` (numpy only); the robot client uses the board's `/media/nvme/lerobot` venv |
+
+The robot client sits with the server rather than on the host because it sends two 640×480 frames per control step — ~110 MB/s at 30 Hz — which should be a loopback copy, not a network hop.
 
 `polima-doctor` runs on both and is the first thing to run after any install.
 

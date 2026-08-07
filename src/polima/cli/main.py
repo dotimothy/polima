@@ -43,7 +43,6 @@ _NOT_YET = {
     "compile": "Phase 1b",
     "deploy": "Phase 1a",
     "run": "Phase 1a",
-    "robot": "Phase 1d",
 }
 
 

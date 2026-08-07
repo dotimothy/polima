@@ -189,6 +189,9 @@ ACT_SPEC = PolicySpec(
     # ----------------------------------------------------------------- robot --
     robot=RobotSpec(
         camera_roles=(("overhead", "Overhead"), ("wrist", "Wrist")),
+        # From the legacy launcher's --perspective-camera / --wrist-camera
+        # defaults: a Logitech C920 overhead and a Sonix wrist camera.
+        camera_hints={"overhead": "C920", "wrist": "Sonix"},
         joint_names=JOINT_NAMES,
         actions_per_chunk=CHUNK,
         default_fps=30,

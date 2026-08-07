@@ -378,6 +378,12 @@ class RobotSpec:
     #: `fourcc: MJPG` in --robot.cameras; PoLiMa must emit it too or the robot
     #: client regresses in a way that only shows up as degraded control.
     camera_fourcc: str = "MJPG"
+    #: role -> substring of the /dev/v4l/by-id name identifying that camera.
+    #: Discovery matches on these instead of falling back on enumeration order:
+    #: /dev/videoN is assigned in plug order, so two cameras can silently swap
+    #: across a reboot, and a swapped pair produces no error at all -- the policy
+    #: runs and the arm reaches for the wrong place.
+    camera_hints: Mapping[str, str] = field(default_factory=dict)
     #: Whether `polima robot` offers --calibrate (backs up the existing
     #: calibration, then runs lerobot-calibrate).
     supports_calibrate: bool = True

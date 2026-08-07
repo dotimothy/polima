@@ -4,11 +4,16 @@ PoLiMa spans two machines with incompatible dependency sets:
 
     HOST  (x86_64 workstation / VM)      BOARD (Modalix SoM, aarch64)
     ------------------------------      ----------------------------
-    polima-compile  torch + lerobot     polima         numpy
-                    (export), and afe   polima-run     numpy
-                    (compile), which    polima robot   flask, cv2, lerobot 0.4.4
-                    are separate venvs
+    build it                            run it
+    polima-compile  export (torch)      polima-run     serve the policy
+                    + compile (afe),    polima robot   drive the arm
+                    two separate venvs                 (lerobot venv)
     polima-deploy   ssh, rsync
+
+The host builds; the board runs. Nothing on the host drives a robot and nothing
+on the board compiles. The robot client sits with the server because it sends
+two 640x480 frames per control step -- ~110 MB/s at 30 Hz -- which should be a
+loopback copy, not a network hop.
 
 PoLiMa does not train. Training stays with `lerobot-train` in the model stacks;
 PoLiMa picks up at the checkpoint.
