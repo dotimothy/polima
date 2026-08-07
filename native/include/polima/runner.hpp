@@ -11,6 +11,8 @@
 #include <sima_lmm/mla_model.hpp>
 
 #include <filesystem>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -21,13 +23,24 @@ namespace polima {
 
 namespace llima = simaai::llima;
 
-// Connects the MLA runtime for the process lifetime. One per process.
+// The MLA runtime connection, shared by every Plan in the process.
+//
+// It used to be one guard per Plan, which was wrong the moment a second Plan
+// could exist: two connects, and then the FIRST plan destroyed would
+// disconnect the runtime out from under the one still using it. The interactive
+// session makes that reachable -- `use` a second model and the first one's
+// teardown pulls the runtime.
+//
+// So it is refcounted: connect on the first Plan, disconnect when the last one
+// goes away. `acquire_mla_runtime()` is the only way to get one.
 struct RuntimeGuard {
   RuntimeGuard() { llima::connect_mla_rt({}); }
   ~RuntimeGuard() { llima::disconnect_mla_rt(); }
   RuntimeGuard(const RuntimeGuard&) = delete;
   RuntimeGuard& operator=(const RuntimeGuard&) = delete;
 };
+
+std::shared_ptr<RuntimeGuard> acquire_mla_runtime();
 
 class Runner {
  public:

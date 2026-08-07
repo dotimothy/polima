@@ -130,6 +130,11 @@ class Plan {
   const std::vector<float>& read_buffer(const Step& step) const;
   void run_step(const Step& step);
 
+  // Declared first, so it is destroyed LAST. Members are torn down in reverse
+  // declaration order, and this used to sit at the bottom -- which disconnected
+  // the MLA runtime before a single Runner had called model_.free().
+  std::shared_ptr<RuntimeGuard> guard_;
+
   std::filesystem::path root_;
   bool verbose_;
   bool collect_timings_ = false;
@@ -145,7 +150,6 @@ class Plan {
   Sidecars sidecars_;
   std::vector<std::string> timings_;
 
-  std::unique_ptr<RuntimeGuard> guard_;
 };
 
 }  // namespace polima

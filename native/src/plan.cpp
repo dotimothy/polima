@@ -8,6 +8,20 @@
 #include <stdexcept>
 
 namespace polima {
+
+std::shared_ptr<RuntimeGuard> acquire_mla_runtime() {
+  // Connect once for the process and disconnect when the last Plan is gone.
+  // The weak_ptr is what makes the second half work: a released Plan drops the
+  // refcount, and only a drop to zero tears the runtime down.
+  static std::mutex lock;
+  static std::weak_ptr<RuntimeGuard> shared;
+  const std::lock_guard<std::mutex> held(lock);
+  if (auto existing = shared.lock()) return existing;
+  auto created = std::make_shared<RuntimeGuard>();
+  shared = created;
+  return created;
+}
+
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -92,7 +106,7 @@ Plan::Plan(const std::filesystem::path& bundle_root, bool verbose)
 
   // One Runner per graph named in bundle.json. Sizes come from the manifest, so
   // nothing about the policy is compiled into this binary.
-  guard_ = std::make_unique<RuntimeGuard>();
+  guard_ = acquire_mla_runtime();
   for (const auto& graph : manifest.at("graphs")) {
     const auto name = graph.at("name").get<std::string>();
     const auto elf = root_ / graph.at("elf").get<std::string>();

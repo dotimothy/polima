@@ -115,6 +115,7 @@ void print_help() {
       "  stages              per-step timings from the last run\n"
       "  check               compare against the bundle's expected output\n"
       "  info                what is loaded: graphs, buffers, wire\n"
+      "  unload              free the model and its MLA buffers\n"
       "  save <file>         write the last result as float32\n"
       "  help, quit\n"
       "\n  arrows for history and cursor, tab to complete, Ctrl-C to abandon\n"
@@ -193,7 +194,8 @@ int repl(const fs::path& store, const std::string& preselect, bool verbose) {
   install_interrupt_handler();
   LineEditor editor;
   const std::vector<std::string> commands = {
-      "models", "use", "run", "bench", "stages", "check", "info", "save", "help", "quit"};
+      "models", "use", "unload", "run", "bench", "stages", "check", "info",
+      "save", "help", "quit"};
   auto refresh_completions = [&]() {
     std::vector<std::string> words = commands;
     for (const auto& entry : entries)
@@ -229,22 +231,35 @@ int repl(const fs::path& store, const std::string& preselect, bool verbose) {
       return false;
     }
     try {
+      // Release the current model FIRST. Building the replacement before
+      // dropping the old one puts both on the MLA at once, which for a pair of
+      // SmolVLA bundles is ~2.6 GB of ELF where one would do. The cost of doing
+      // it this way is that a failed load leaves nothing loaded, which the
+      // message below says plainly.
+      const bool had_model = plan != nullptr;
+      plan.reset();
+      loaded.clear();
+      last_result.clear();
+      staging.clear();
+
       const auto started = Clock::now();
-      std::unique_ptr<Plan> candidate;
       {
         Quiet quiet(!verbose);
-        candidate = std::make_unique<Plan>(chosen->root, verbose);
+        plan = std::make_unique<Plan>(chosen->root, verbose);
       }
       const double ms = since(started);
-      plan = std::move(candidate);
       loaded = chosen->name;
+      (void)had_model;
       last_result.clear();
       staging.clear();
       std::cout << "  loaded " << loaded << " (" << chosen->graphs << " graphs, "
                 << std::fixed << std::setprecision(1) << ms / 1000.0 << "s)\n";
       return true;
     } catch (const std::exception& error) {
-      std::cout << "  failed to load " << chosen->name << ": " << error.what() << "\n";
+      plan.reset();
+      loaded.clear();
+      std::cout << "  failed to load " << chosen->name << ": " << error.what()
+                << "\n  nothing is loaded now\n";
       return false;
     }
   };
@@ -303,6 +318,23 @@ int repl(const fs::path& store, const std::string& preselect, bool verbose) {
           continue;
         }
         if (load(words[1])) refresh_completions();
+        continue;
+      }
+
+      if (command == "unload") {
+        if (plan == nullptr) { std::cout << "  nothing loaded\n"; continue; }
+        // Runner's destructor frees each model and both MLA buffers; dropping
+        // the last Plan also disconnects the runtime. Explicit because the only
+        // other way to release the MLA was to quit the session.
+        const std::string was = loaded;
+        {
+          Quiet quiet(!verbose);
+          plan.reset();
+        }
+        loaded.clear();
+        last_result.clear();
+        staging.clear();
+        std::cout << "  unloaded " << was << "\n";
         continue;
       }
 
