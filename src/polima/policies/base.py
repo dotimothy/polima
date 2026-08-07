@@ -147,11 +147,28 @@ class DatasetContract:
             raise SpecError(f"{where}: camera_shape must be (H, W, C)")
 
 
-# -------------------------------------------------------------------- training
+# ------------------------------------------------------------ checkpoint origin
 
 
 @dataclass(frozen=True)
 class TrainSpec:
+    """Where a checkpoint came from. PoLiMa does not train.
+
+    Training stays with `lerobot-train` in the model stacks; PoLiMa picks up at
+    the checkpoint and covers compile, deploy and robot control. What survives
+    here is only what the *export* stage needs in order to read a checkpoint
+    someone else produced:
+
+      conda_env        which environment has the torch + lerobot that can load it
+      checkpoint_glob  where checkpoints live under a run directory
+      backend          which trainer wrote it, so a mismatch is legible
+
+    The remaining fields describe the training invocation. They are retained
+    because they document how the checkpoints in this tree were produced -- and
+    because reading them is how `polima data validate` knows what a run expected
+    -- but nothing in PoLiMa executes them.
+    """
+
     backend: Literal["lerobot-train", "groot-launch-finetune"]
     conda_env: str
     entrypoint: tuple[str, ...]

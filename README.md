@@ -1,6 +1,8 @@
 # PoLiMa
 
-**Po**licy + Si**Ma** — a unified framework for training, compiling and deploying robot policies (ACT, SmolVLA, GR00T) onto SiMa.ai Modalix hardware.
+**Po**licy + Si**Ma** — a unified framework for compiling, deploying and running robot policies (ACT, SmolVLA, GR00T) on SiMa.ai Modalix hardware.
+
+**PoLiMa does not train.** Training stays where it is, with `lerobot-train` in the model stacks. PoLiMa picks up at the checkpoint and owns everything after it: export → compile → bundle → deploy → serve → drive the arm.
 
 PoLiMa is the robot-policy analogue of **LLiMa**, and uses it under the hood: VLM backbones go through `sima_lmm.host.compile_lmm`, action experts go through `afe`. It mirrors LLiMa's shape deliberately — separate console scripts per stage, not one monolith.
 
@@ -14,8 +16,8 @@ PoLiMa spans two machines with incompatible dependency sets. That split is struc
 
 | | **HOST** (x86_64 workstation) | **BOARD** (Modalix SoM, aarch64) |
 |---|---|---|
-| | `polima-train` — torch, lerobot | `polima` — umbrella |
-| | `polima-compile` — afe, onnx, onnxsim | `polima-run` — inference |
+| | `polima-compile` — export (torch, lerobot) then compile (afe, onnx) | `polima` — umbrella |
+| | | `polima-run` — inference |
 | | `polima-deploy` — ssh, rsync | `polima-robot` — teleop, live view |
 | deps | `polima[host]` | `polima` (numpy only) or `polima[robot]` |
 
@@ -64,9 +66,8 @@ src/polima/
   policies/   THE PLUGIN LAYER -- one PolicySpec per policy
   config/     layered config (dataclasses + stdlib loader; no pydantic)
   data/       dataset contracts, discovery, episode specs, aggregation
-  train/      TrainRunner            <- replaces 3 bash scripts (~1,485 lines)
-  export/     torch -> ONNX helpers
-  compile/    afe + llima wrappers, the Stage state machine
+  export/     checkpoint -> ONNX + calibration + fixtures
+  compile/    afe wrapper, the per-graph compile driver
   bundle/     content-addressed bundles, MPK unpack, path rewriting
   deploy/     ssh/rsync, board bootstrap, health poll, smoke test
   wire/       the SoM TCP protocol   <- replaces 2 hand-written clients
@@ -96,13 +97,13 @@ make check-legacy-intact  # sha256 all 129 first-party files
 make restore-legacy       # undo, from the newest backup
 ```
 
-Backups live outside `polima/` so removing the framework never takes the safety net with it. `make check-legacy-intact` gates every phase boundary until `git init` lands in Phase 2.
+Backups live outside `polima/` so removing the framework never takes the safety net with it. `make check-legacy-intact` predates version control and is now largely redundant with git; it stays as a fast on-disk check.
 
 ---
 
 ## Status
 
-169 unit tests, no hardware required. Both milestones so far are proven against
+186 unit tests, no hardware required. Every milestone so far is proven against
 the real board rather than asserted:
 
 | Stage | State | Proof |
@@ -110,7 +111,6 @@ the real board rather than asserted:
 | `polima doctor` / `data` / `list` | working | |
 | `polima-deploy` / `polima-run` | working | 20.8 ms on the SoM, cosine 0.999990 vs PyTorch — 24% faster than the hand-written `act_llima` at 27.0 ms |
 | `polima-compile` | working | checkpoint → ONNX → ELF → bundle reproduces **byte for byte**, landing on the same content-addressed bundle id as the one deployed ([export](docs/export.md), [compile](docs/compile.md)) |
-| `polima-train` | Phase 1c | |
 | `polima-robot` | Phase 1d | |
 | SmolVLA / GR00T | Phases 4–5 | |
 

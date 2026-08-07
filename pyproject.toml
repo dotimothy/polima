@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "polima"
 version = "0.1.0"
-description = "PoLiMa - unified train/compile/deploy framework for robot policies on SiMa.ai Modalix"
+description = "PoLiMa - unified compile/deploy/control framework for robot policies on SiMa.ai Modalix"
 readme = "README.md"
 requires-python = ">=3.10"
 
@@ -14,9 +14,12 @@ requires-python = ">=3.10"
 # PoLiMa spans two machines, and the base install is what the BOARD gets:
 #
 #   HOST  (x86_64)                        BOARD (Modalix SoM, aarch64)
-#   polima-train    torch + lerobot       polima        numpy only
-#   polima-compile  afe + onnx + onnxsim  polima-run    numpy only
+#   polima-compile  export: torch+lerobot polima        numpy only
+#                   compile: afe+onnx     polima-run    numpy only
 #   polima-deploy   ssh + rsync           polima-robot  flask + cv2 + lerobot 0.4.4
+#
+# PoLiMa does not train. Training stays with lerobot-train in the model stacks;
+# PoLiMa starts from a checkpoint and covers compile, deploy and robot control.
 #
 # Both halves share one core -- polima.policies, polima.wire, polima.bundle,
 # polima.config, polima.util -- because that core IS the contract between them:
@@ -31,11 +34,11 @@ dependencies = ["numpy"]
 
 [project.optional-dependencies]
 # Host-side stages.
-train   = ["torch", "safetensors", "pyarrow", "draccus", "pyyaml"]
+export  = ["torch", "safetensors", "pyarrow", "draccus", "pyyaml"]
 compile = ["onnx", "onnxsim", "onnxruntime", "pyyaml"]
 deploy  = ["pyyaml"]
-host    = ["polima[train,compile,deploy]"]
-# Board-side. Deliberately excludes torch/afe: the board never trains or compiles.
+host    = ["polima[export,compile,deploy]"]
+# Board-side. Deliberately excludes torch/afe: the board never compiles.
 robot   = ["flask", "opencv-python-headless"]
 board   = ["polima[robot]"]
 dev     = ["pytest", "ruff"]
@@ -44,7 +47,6 @@ dev     = ["pytest", "ruff"]
 # Umbrella, installed everywhere. `polima compile ...` == `polima-compile ...`.
 polima = "polima.cli.main:main"
 # Host stages -- mirrors llima-compile / llima-deploy.
-polima-train = "polima.cli.entry:train"
 polima-compile = "polima.cli.entry:compile_"
 polima-deploy = "polima.cli.entry:deploy"
 # Board stages -- mirrors llima-run.

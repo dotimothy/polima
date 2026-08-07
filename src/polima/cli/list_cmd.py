@@ -37,7 +37,7 @@ def run(argv: list[str], parent: argparse.Namespace | None = None) -> int:
             f"{spec.wire.magic_ascii}:{spec.wire.default_port}",
             f"{spec.robot.actions_per_chunk}x{spec.dataset.action_dim}",
         ])
-    print(table.render(rows, headers=["policy", "graphs", "train backend", "wire", "chunk"]))
+    print(table.render(rows, headers=["policy", "graphs", "checkpoints from", "wire", "chunk"]))
 
     if args.graphs:
         for name, spec in specs.items():

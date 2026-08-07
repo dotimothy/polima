@@ -4,9 +4,14 @@ PoLiMa spans two machines with incompatible dependency sets:
 
     HOST  (x86_64 workstation / VM)      BOARD (Modalix SoM, aarch64)
     ------------------------------      ----------------------------
-    polima-train    torch, lerobot      polima         numpy
-    polima-compile  afe, onnx, onnxsim  polima-run     numpy
-    polima-deploy   ssh, rsync          polima robot   flask, cv2, lerobot 0.4.4
+    polima-compile  torch + lerobot     polima         numpy
+                    (export), and afe   polima-run     numpy
+                    (compile), which    polima robot   flask, cv2, lerobot 0.4.4
+                    are separate venvs
+    polima-deploy   ssh, rsync
+
+PoLiMa does not train. Training stays with `lerobot-train` in the model stacks;
+PoLiMa picks up at the checkpoint.
 
 Both halves share one core -- policy specs, wire protocol, bundle layout, config
 -- because that core *is* the contract between them: the host writes bundle.json
@@ -30,15 +35,15 @@ BOARD = "board"
 BOTH = "both"
 UNKNOWN = "unknown"
 
-#: Commands that only make sense on the machine that trains and compiles.
-HOST_COMMANDS = ("train", "compile", "deploy")
+#: Commands that only make sense on the machine that compiles.
+HOST_COMMANDS = ("compile", "deploy")
 #: Commands that run where the MLA and the arm are.
 BOARD_COMMANDS = ("run", "robot")
 #: Commands that work anywhere.
 SHARED_COMMANDS = ("doctor", "data", "list")
 
 _CAPABILITY_MODULES = {
-    "torch": "train",
+    "torch": "export (compile stage)",
     "afe": "compile",
     "onnx": "compile",
     "flask": "robot live view",
@@ -72,7 +77,6 @@ def is_board() -> bool:
 class Capabilities:
     role: str
     machine: str
-    can_train: bool
     can_compile: bool
     can_deploy: bool
     can_run: bool
@@ -81,7 +85,6 @@ class Capabilities:
 
     def allows(self, command: str) -> bool:
         return {
-            "train": self.can_train,
             "compile": self.can_compile,
             "deploy": self.can_deploy,
             "run": self.can_run,
@@ -90,7 +93,6 @@ class Capabilities:
 
     def explain(self, command: str) -> str:
         needs = {
-            "train": "torch + lerobot (conda env `act`); install with polima[host]",
             "compile": "the SiMa model-compiler venv (afe, onnx, onnxsim); "
                        "set MODEL_COMPILER_BIN=/path/to/model-compiler/bin",
             "deploy": "ssh and rsync on PATH",
@@ -132,7 +134,6 @@ def detect() -> Capabilities:
     from polima.compile.toolchain import find_compiler_bin
 
     board = is_board()
-    can_train = _installed("torch") and _installed("lerobot")
     # Compiling does not need afe *here*: `polima compile` runs the compiler as a
     # subprocess under its own venv, because that venv has afe but no torch and
     # the training env has torch but no afe -- they can never be one interpreter.
@@ -144,8 +145,8 @@ def detect() -> Capabilities:
     can_robot = _installed("flask") and _installed("cv2")
 
     if board:
-        role = BOTH if (can_train or can_compile) else BOARD
-    elif can_train or can_compile or can_deploy:
+        role = BOTH if can_compile else BOARD
+    elif can_compile or can_deploy:
         role = HOST
     else:
         role = UNKNOWN
@@ -157,7 +158,6 @@ def detect() -> Capabilities:
     return Capabilities(
         role=role,
         machine=platform.machine(),
-        can_train=can_train,
         can_compile=can_compile,
         can_deploy=can_deploy,
         can_run=True,

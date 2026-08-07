@@ -124,16 +124,22 @@ def _manage(args, board, dry_run: bool) -> int:
             print(f"current -> {args.activate}")
             return 0
 
-        port = args.port or board.port or 0
-        status = service_status(session, board, port or None)
         current = board_ops.current_bundle(session, board)
-        print(table.render(
-            [["current", current or "-"],
-             ["running", str(status.running)],
-             ["pid", status.pid or "-"],
-             ["port", port or "-"],
-             ["listening", str(status.listening)]],
-        ))
+        # Without a resolved port there is nothing to probe, and `--status`
+        # would report `listening False` for a server that is plainly serving.
+        # The port comes from the active bundle's own policy.
+        port = args.port or board.port or _default_port(current)
+        status = service_status(session, board, port or None)
+        rows = [["current", current or "-"],
+                ["running", str(status.running)],
+                ["pid", status.pid or "-"],
+                ["port", port or "-"],
+                ["listening", str(status.listening)]]
+        if status.bound and status.pid not in status.bound:
+            # The Phase-1a failure: a stale server answers while the recorded
+            # process is dead, so redeploys appear to work and change nothing.
+            rows.append(["WARNING", f"port held by pid(s) {status.bound}, not {status.pid}"])
+        print(table.render(rows))
         return 0
 
 
@@ -151,3 +157,20 @@ def _resolve_bundle(reference: str, bundles_root: str | None) -> Bundle:
         )
         raise SystemExit(2)
     return Bundle.from_dict(read_json(manifest), candidate)
+
+
+def _default_port(bundle_id: str | None) -> int:
+    """The wire port of the policy that owns `bundle_id`.
+
+    Bundle ids lead with the policy name (`act-<dataset>-<steps>-<sha>`), which
+    is enough to find the spec without fetching bundle.json off the board.
+    """
+    from polima.policies.registry import available
+
+    name = (bundle_id or "").split("-")[0]
+    if name not in available():
+        name = "act"
+    try:
+        return get_policy(name).wire.default_port
+    except (KeyError, AttributeError):
+        return 0

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import shlex
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from polima.config.base import BoardConfig
 from polima.deploy.ssh import BoardSession
@@ -29,26 +29,36 @@ class ServiceStatus:
     port: int | None
     bundle: str | None = None
     listening: bool = False
+    #: Pid(s) actually bound to the port, which can differ from `pid`.
+    bound: list[int] = field(default_factory=list)
+
+    @property
+    def healthy(self) -> bool:
+        """Serving, and served by the process we think we started."""
+        return self.listening and self.pid is not None and self.pid in self.bound
 
     def to_dict(self) -> dict:
         return {
             "running": self.running, "pid": self.pid, "port": self.port,
             "bundle": self.bundle, "listening": self.listening,
+            "bound": self.bound, "healthy": self.healthy,
         }
 
 
 def status(session: BoardSession, board: BoardConfig, port: int | None = None) -> ServiceStatus:
+    """What is actually serving, which is not always what the pid file says.
+
+    `bound` is the pid(s) holding the port, resolved independently of the pid
+    file. The two disagreeing is the exact Phase-1a failure -- a stale server
+    kept answering while every redeploy died on bind -- so status reports both
+    rather than trusting either.
+    """
     pid_text = session.capture(f"cat {shlex.quote(board.path('var/run/server.pid'))} 2>/dev/null")
     pid = int(pid_text) if pid_text.strip().isdigit() else None
     alive = bool(pid) and session.run(f"kill -0 {pid} 2>/dev/null", check=False).returncode == 0
-    listening = False
-    if port:
-        listening = bool(
-            session.capture(f"ss -ltn 2>/dev/null | grep -c ':{port} ' || true").strip() not in
-            ("", "0")
-        )
+    bound = listening_pids(session, port) if port else []
     return ServiceStatus(running=alive, pid=pid if alive else None, port=port,
-                         listening=listening)
+                         listening=bool(bound), bound=bound)
 
 
 def listening_pids(session: BoardSession, port: int) -> list[int]:

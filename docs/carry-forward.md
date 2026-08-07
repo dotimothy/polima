@@ -24,7 +24,7 @@ just degrades.
 blob. The legacy stacks each hand-wrote it, which is why the fix had to be
 applied twice.
 
-## `LD_LIBRARY_PATH` for TorchCodec   [Phase 1c]
+## `LD_LIBRARY_PATH` for TorchCodec   [export]
 
     ACT/install_act_env.sh
     ACT/train_act_local.sh
@@ -40,9 +40,11 @@ with a bare import error that says nothing about FFmpeg.
 Note this also means `conda run` is insufficient: the variable has to be exported
 into the activated environment.
 
-**In PoLiMa:** `polima/train/env.py::conda_run` must export it after activating.
-`train_act_local.sh` also preflights the import and points at the installer,
-which the TrainRunner should keep.
+**In PoLiMa:** this is an *export* requirement, not a training one -- PoLiMa
+does not train, but `polima compile --checkpoint` loads a LeRobotDataset to
+draw calibration samples, and that decodes video through TorchCodec. Anything
+that shells into the `act` env for the export stage has to export it after
+activating.
 
 ## SO-101 CLI registration   [Phase 1d]
 

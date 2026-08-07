@@ -1,7 +1,7 @@
 """Host/board split.
 
 PoLiMa installs as LLiMa does -- separate console scripts per stage
-(polima-train / polima-compile / polima-deploy on the host, polima / polima-run /
+(polima-compile / polima-deploy on the host, polima / polima-run /
 polima-robot on the board). These tests pin the two properties that split has to
 guarantee:
 
@@ -80,7 +80,7 @@ def test_host_and_board_commands_do_not_overlap():
     assert not set(role.HOST_COMMANDS) & set(role.BOARD_COMMANDS)
 
 
-@pytest.mark.parametrize("command", ["train", "compile", "deploy", "run", "robot"])
+@pytest.mark.parametrize("command", ["compile", "deploy", "run", "robot"])
 def test_capabilities_explain_every_stage(command):
     assert role.detect().explain(command)
 
@@ -92,7 +92,7 @@ def test_shared_commands_always_allowed():
 
 
 BOARD = role.Capabilities(
-    role=role.BOARD, machine="aarch64", can_train=False, can_compile=False,
+    role=role.BOARD, machine="aarch64", can_compile=False,
     can_deploy=False, can_run=True, can_robot=True, missing={},
 )
 
@@ -130,7 +130,7 @@ def test_needs_capability_refines_by_argv():
 def test_umbrella_dispatch_matches_entry_points():
     from polima.cli import entry
 
-    for command in ("train", "compile", "deploy", "run", "robot"):
+    for command in ("compile", "deploy", "run", "robot"):
         attribute = {"compile": "compile_", "run": "run_"}.get(command, command)
         assert hasattr(entry, attribute), f"missing console-script entry for {command}"
 

@@ -5,7 +5,6 @@ than one monolith:
 
     HOST                          BOARD
     ----------------------        ----------------------
-    polima-train                  polima          (umbrella)
     polima-compile                polima-run
     polima-deploy                 polima-robot
 
@@ -91,7 +90,6 @@ def _split_globals(argv: list[str]) -> tuple[list[str], list[str]]:
 
 # --- the console scripts declared in pyproject.toml -------------------------
 
-train = make_entry("train", "polima.cli.train")
 compile_ = make_entry("compile", "polima.cli.compile")
 deploy = make_entry("deploy", "polima.cli.deploy")
 run_ = make_entry("run", "polima.cli.run")

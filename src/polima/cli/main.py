@@ -1,9 +1,8 @@
-"""`polima` -- one CLI for training, compiling, deploying and running robot
-policies on SiMa.ai Modalix.
+"""`polima` -- one CLI for compiling, deploying and running robot policies on
+SiMa.ai Modalix.
 
 Mirrors LLiMa's shape (llima-compile / llima-deploy / llima-run) as subcommands:
 
-    polima train    --policy act --dataset rcwb_f_t
     polima compile  --policy act --checkpoint <path>
     polima deploy   --bundle <id> --board sima@192.168.91.211
     polima run      --bundle <id> --fixture
@@ -34,7 +33,6 @@ COMMANDS = {
     "doctor": ("polima.cli.doctor", "diagnose the environment (host, compiler venv, board)"),
     "data": ("polima.cli.data", "inspect, validate and combine datasets"),
     "list": ("polima.cli.list_cmd", "list registered policies"),
-    "train": ("polima.cli.train", "train a policy"),
     "compile": ("polima.cli.compile", "export, quantize and compile a policy to MLA ELFs"),
     "deploy": ("polima.cli.deploy", "push a bundle to a Modalix board and start it"),
     "run": ("polima.cli.run", "run inference against a deployed bundle"),
@@ -42,7 +40,6 @@ COMMANDS = {
 }
 
 _NOT_YET = {
-    "train": "Phase 1c",
     "compile": "Phase 1b",
     "deploy": "Phase 1a",
     "run": "Phase 1a",

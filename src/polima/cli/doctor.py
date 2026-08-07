@@ -140,7 +140,6 @@ def check_role(doc: Doctor) -> None:
     doc.heading(f"install role: {capabilities.role} ({capabilities.machine})")
 
     stages = (
-        ("train", capabilities.can_train, role.HOST),
         ("compile", capabilities.can_compile, role.HOST),
         ("deploy", capabilities.can_deploy, role.HOST),
         ("run", capabilities.can_run, role.BOARD),
