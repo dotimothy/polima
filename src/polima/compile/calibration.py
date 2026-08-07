@@ -137,6 +137,30 @@ def random(names: Sequence[str], shapes: Sequence[Shape], layout: str = "NCHW",
     return out
 
 
+def plan(activation: str, weights: str, npz: str | Path | None = None,
+         raw_f32: str | Path | None = None) -> tuple[str, str | Path | None, str]:
+    """Decide which calibration source a compile actually needs.
+
+    bf16 is a float format: there are no scales to fit, so calibration data
+    cannot change the generated code. afe still wants one sample to trace
+    shapes, but the values are ignored -- verified by compiling ACT's
+    decoder_action_tail with 8 real dataset samples and with 1 random sample and
+    getting the identical ELF (b1eece6992dbddc6...).
+
+    This matters beyond tidiness: it is what lets a pure-bf16 build skip the
+    dataset entirely, and skip reading calibration files that run to hundreds of
+    megabytes. Every ACT and SmolVLA graph currently compiles bf16.
+    """
+    if activation == "bf16" and weights == "bf16":
+        note = "bf16 has no scales to fit" if (npz or raw_f32) else ""
+        return "random", None, note
+    if npz:
+        return "npz", npz, ""
+    if raw_f32:
+        return "raw_f32", raw_f32, ""
+    return "random", None, "int8 with random calibration data -- expect drift"
+
+
 def build(kind: str, path: str | Path | None, names: Sequence[str],
           shapes: Sequence[Shape], layout: str = "NCHW", samples: int = 8,
           types: Mapping[str, str] | None = None) -> list[Sample]:

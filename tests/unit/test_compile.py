@@ -427,3 +427,36 @@ def test_import_legacy_still_needs_no_compiler():
     assert compile_cli.needs_capability(["--import-legacy", "/x"]) is None
     assert compile_cli.needs_capability(["--build-dir", "/x"]) == "compile"
     assert compile_cli.needs_capability(["--checkpoint", "/x"]) == "compile"
+
+
+# ------------------------------------------------- calibration is int8-only
+
+
+def test_bf16_ignores_supplied_calibration():
+    """bf16 has no scales to fit. Verified against hardware: ACT's
+    decoder_action_tail compiled with 8 real dataset samples and with 1 random
+    sample produces the identical ELF, b1eece6992dbddc6..."""
+    kind, source, note = calib.plan("bf16", "bf16", npz="/big/file.npz")
+    assert kind == "random" and source is None
+    assert "no scales" in note
+
+
+def test_bf16_without_calibration_says_nothing():
+    kind, source, note = calib.plan("bf16", "bf16")
+    assert (kind, source, note) == ("random", None, "")
+
+
+def test_int8_still_uses_calibration():
+    assert calib.plan("int8", "int8", npz="/c.npz") == ("npz", "/c.npz", "")
+    assert calib.plan("int8", "int8", raw_f32="/c.f32") == ("raw_f32", "/c.f32", "")
+
+
+def test_mixed_precision_keeps_calibration():
+    """int8 weights with bf16 activations still fits weight scales."""
+    kind, _, _ = calib.plan("bf16", "int8", npz="/c.npz")
+    assert kind == "npz"
+
+
+def test_int8_without_calibration_warns_about_drift():
+    _, _, note = calib.plan("int8", "int8")
+    assert "drift" in note

@@ -252,24 +252,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     target = gen2_target if args.device == "modalix" else gen1_target
     loaded = load_model(importer, target=target)
 
+    activation = args.activation_precision or args.precision
+    weights = args.weight_precision or args.precision
+    all_bf16 = activation == "bf16" and weights == "bf16"
+
     if args.calibration_npz and args.calibration_raw_f32:
         raise SystemExit("pass at most one of --calibration-npz / --calibration-raw-f32")
-    if args.calibration_npz:
-        kind, source = "npz", args.calibration_npz
-    elif args.calibration_raw_f32:
-        kind, source = "raw_f32", args.calibration_raw_f32
-    else:
-        kind, source = "random", None
-        if args.precision == "int8":
-            print("[WARN] int8 compile with random calibration data -- expect drift.")
+
+    kind, source, note = calib.plan(
+        activation, weights, args.calibration_npz, args.calibration_raw_f32
+    )
+    if note:
+        print(f"[{'WARN' if 'drift' in note else 'INFO'}] {note}")
+
     samples = calib.build(
         kind, source, names, shapes, layout=args.model_layout,
         types=dict(zip(names, type_names, strict=True)),
     )
     print(f"[INFO] Calibration: {kind}, {len(samples)} sample(s)")
-
-    activation = args.activation_precision or args.precision
-    weights = args.weight_precision or args.precision
     config = (
         default_quantization
         .with_activation_quantization(
