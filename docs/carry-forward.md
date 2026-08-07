@@ -96,6 +96,28 @@ copy that can drift.
 **In PoLiMa:** one `robot/camera_focus_config.json` on the board, referenced by
 config rather than duplicated per policy.
 
+## Compiled stages must be reusable across runs   [Phase 1b]
+
+    SmolVLA/scripts/compile_deploy_smolvla_som.sh   --reuse-vision-dir
+
+The vision tower is the most expensive stage to compile and the one that changes
+least: it is the frozen SmolVLM backbone, so it is identical across every
+fine-tune of the same base. Recompiling it on each iteration of the prefix /
+suffix / denoise stages wastes the bulk of the wall clock, and the script notes
+those stages already have to run sequentially because each needs substantial
+host RAM.
+
+The flag skips the compile and `rsync`s a previously unpacked
+`models_uncompressed/vision_llima_bf16` into place instead. Note it also has to
+move the *existence check* for that stage, since `$VISION_ONNX` need not exist
+when the compiled output is being reused.
+
+**In PoLiMa:** this is a general property, not a SmolVLA quirk -- ACT's vision
+backbone has the same character. The compile driver should key each stage by a
+content hash of (onnx, calibration input, compile flags) and skip stages whose
+key is unchanged, so reuse is automatic rather than a manual flag. That is the
+same content-addressing already used for bundles and for the native build skip.
+
 ## Task strings belong to the dataset
 
 The SmolVLA task moved from "Place the red cube in the black basket." to
