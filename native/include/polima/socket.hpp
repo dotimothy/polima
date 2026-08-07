@@ -11,6 +11,7 @@
 
 #include <cstdint>
 #include <stdexcept>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -63,10 +64,15 @@ class Args {
     return false;
   }
 
-  std::string get(const std::string& key, const std::string& fallback = {}) const {
+  // The fallback is optional rather than an empty string sentinel. Testing
+  // `!fallback.empty()` made `get(key, "")` -- "absent is fine, and the default
+  // is empty" -- indistinguishable from `get(key)` -- "required", so it threw.
+  // That is exactly what `--output` and an unselected model both want to say.
+  std::string get(const std::string& key,
+                  const std::optional<std::string>& fallback = std::nullopt) const {
     for (int index = 1; index + 1 < argc_; ++index)
       if (key == argv_[index]) return argv_[index + 1];
-    if (!fallback.empty()) return fallback;
+    if (fallback.has_value()) return *fallback;
     throw std::runtime_error("missing required argument " + key);
   }
 

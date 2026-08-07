@@ -10,6 +10,7 @@
 //              --output /tmp/actions.f32 [--dump-stages /tmp/stages]
 
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <map>
@@ -17,6 +18,7 @@
 #include <vector>
 
 #include "polima/plan.hpp"
+#include "polima/repl.hpp"
 #include "polima/sidecar.hpp"
 #include "polima/socket.hpp"
 
@@ -34,9 +36,22 @@ int main(int argc, char** argv) {
         "  --output FILE       write the result as float32\n"
         "  --dump-stages DIR   write every intermediate buffer, for bisecting\n"
         "  --verbose           per-step timings\n"
-        "  -h, --help          this message\n";
+        "  --models-dir DIR    the board's model store\n"
+        "                      (default: $POLIMA_ROOT/models or /media/nvme/polima/models)\n"
+        "  -h, --help          this message\n"
+        "\nWith no --bundle it opens an interactive session over the model\n"
+        "store: the model loads once and every command after that is fast.\n";
       return 0;
     }
+
+    // No bundle named -> interactive, the way `llima run` hands you a session
+    // rather than exiting after one answer. `--bundle` keeps the one-shot path,
+    // which scripts and the deploy smoke test depend on.
+    const char* env_root = std::getenv("POLIMA_ROOT");
+    const fs::path store = args.get(
+        "--models-dir", (fs::path(env_root ? env_root : "/media/nvme/polima") / "models").string());
+    if (!args.has("--bundle") || args.has("--interactive"))
+      return polima::repl(store, args.get("--bundle", ""), args.has("--verbose"));
     const fs::path bundle = args.get("--bundle");
     const bool verbose = args.has("--verbose");
 
