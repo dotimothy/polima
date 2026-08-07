@@ -118,6 +118,10 @@ class Plan {
   const std::string& policy() const { return policy_; }
   size_t result_elements() const { return buffer_sizes_.at(result_); }
   const std::vector<std::string>& stage_timings() const { return timings_; }
+  // Timing builds a string per step, which on SmolVLA's 82-step plan is real
+  // work on the request path -- so it is off unless asked for, and `stages`
+  // turns it on for exactly one run rather than requiring a restart.
+  void set_collect_timings(bool on) { collect_timings_ = on; }
 
  private:
   std::vector<float>& buffer(const std::string& name);
@@ -128,6 +132,7 @@ class Plan {
 
   std::filesystem::path root_;
   bool verbose_;
+  bool collect_timings_ = false;
   std::string bundle_id_;
   std::string policy_;
   std::string result_;

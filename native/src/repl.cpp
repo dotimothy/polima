@@ -10,11 +10,13 @@
 #include <numeric>
 #include <sstream>
 
+#include <cerrno>
 #include <fcntl.h>
 #include <unistd.h>
 
 #include <nlohmann/json.hpp>
 
+#include "polima/lineedit.hpp"
 #include "polima/plan.hpp"
 #include "polima/socket.hpp"
 
@@ -114,7 +116,9 @@ void print_help() {
       "  check               compare against the bundle's expected output\n"
       "  info                what is loaded: graphs, buffers, wire\n"
       "  save <file>         write the last result as float32\n"
-      "  help, quit\n\n";
+      "  help, quit\n"
+      "\n  arrows for history and cursor, tab to complete, Ctrl-C to abandon\n"
+      "  a line or a running bench\n\n";
 }
 
 }  // namespace
@@ -184,6 +188,17 @@ int repl(const fs::path& store, const std::string& preselect, bool verbose) {
       std::cout << "\n";
     }
     std::cout << "\n";
+  };
+
+  install_interrupt_handler();
+  LineEditor editor;
+  const std::vector<std::string> commands = {
+      "models", "use", "run", "bench", "stages", "check", "info", "save", "help", "quit"};
+  auto refresh_completions = [&]() {
+    std::vector<std::string> words = commands;
+    for (const auto& entry : entries)
+      if (entry.managed) words.push_back(entry.name);
+    editor.set_completions(std::move(words));
   };
 
   std::unique_ptr<Plan> plan;
@@ -263,10 +278,11 @@ int repl(const fs::path& store, const std::string& preselect, bool verbose) {
   else if (entries.size() == 1 && entries[0].managed) load(entries[0].name);
   std::cout << "type `help` for commands\n";
 
+  refresh_completions();
   std::string line;
   while (true) {
-    std::cout << (loaded.empty() ? "polima" : loaded) << "> " << std::flush;
-    if (!std::getline(std::cin, line)) { std::cout << "\n"; break; }
+    g_interrupted = 0;
+    if (!editor.read((loaded.empty() ? "polima" : loaded) + "> ", line)) break;
     const auto words = split(line);
     if (words.empty()) continue;
     const std::string& command = words[0];
@@ -276,12 +292,17 @@ int repl(const fs::path& store, const std::string& preselect, bool verbose) {
       if (command == "help" || command == "?") { print_help(); continue; }
       if (command == "models" || command == "ls") {
         entries = scan_store(store);
+        refresh_completions();
         show_models();
         continue;
       }
       if (command == "use") {
-        if (words.size() < 2) { std::cout << "  usage: use <n|name>\n"; continue; }
-        load(words[1]);
+        if (words.size() < 2) {
+          show_models();
+          std::cout << "  usage: use <n|name>\n";
+          continue;
+        }
+        if (load(words[1])) refresh_completions();
         continue;
       }
 
@@ -314,24 +335,35 @@ int repl(const fs::path& store, const std::string& preselect, bool verbose) {
         const int count = words.size() > 1 ? std::max(1, std::stoi(words[1])) : 20;
         std::vector<double> samples;
         samples.reserve(count);
-        for (int index = 0; index < count; ++index) samples.push_back(execute());
+        for (int index = 0; index < count && !g_interrupted; ++index)
+          samples.push_back(execute());
+        if (g_interrupted) {
+          std::cout << "  interrupted after " << samples.size() << " run(s)\n";
+          g_interrupted = 0;
+          if (samples.empty()) continue;
+        }
         std::sort(samples.begin(), samples.end());
         const double mean =
             std::accumulate(samples.begin(), samples.end(), 0.0) / samples.size();
         std::cout << std::fixed << std::setprecision(1)
                   << "  min " << samples.front() << " / mean " << mean
                   << " / median " << samples[samples.size() / 2]
-                  << " / max " << samples.back() << " ms over " << count << " runs\n";
+                  << " / max " << samples.back() << " ms over " << samples.size()
+                  << " runs\n";
         continue;
       }
 
       if (command == "stages") {
-        const auto& timings = plan->stage_timings();
-        if (timings.empty()) {
-          std::cout << "  no timings -- start polima-cli with --verbose, then `run`\n";
-        } else {
-          for (const auto& timing : timings) std::cout << "  " << timing << "\n";
-        }
+        // Run once with timing on rather than asking for a restart with
+        // --verbose. Timing costs a string per step, so it goes straight back
+        // off: on SmolVLA that is 82 allocations per inference.
+        if (!ensure_inputs()) continue;
+        plan->set_collect_timings(true);
+        const double ms = execute();
+        plan->set_collect_timings(verbose);
+        std::cout << std::fixed << std::setprecision(1) << "  total " << ms << " ms\n";
+        for (const auto& timing : plan->stage_timings())
+          std::cout << "    " << timing << "\n";
         continue;
       }
 

@@ -125,3 +125,24 @@ polima compile --checkpoint <ckpt> --build-dir <dir>   # export, compile, pack
 polima compile --build-dir <dir>                       # recompile what changed
 polima compile --import-legacy <dir>                   # adopt an existing tree
 ```
+
+### On the board
+
+`polima-cli` with no arguments opens a session over the board's model store,
+the way `llima run` does — the model loads once and everything after is fast:
+
+```
+polima> use 1
+  loaded act-rcwb_f_t-100000-a3573dae (6 graphs, 0.1s)
+act-rcwb_f_t-100000-a3573dae> run
+  600 floats in 22.5 ms
+act-rcwb_f_t-100000-a3573dae> stages
+  total 22.3 ms
+    run_elf:vision_backbone=4.977770
+    run_elf:vision_backbone=4.911727
+    ...
+```
+
+`models` / `use` / `run` / `bench` / `stages` / `check` / `info` / `save`, with
+history, cursor keys and tab completion. `--bundle` still runs once and exits.
+Deploy links `polima-cli` and `polima-server` onto `PATH`, next to `llima`.

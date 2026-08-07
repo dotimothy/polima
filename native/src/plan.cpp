@@ -58,7 +58,8 @@ const char* opcode_name(Opcode opcode) {
 }
 
 Plan::Plan(const std::filesystem::path& bundle_root, bool verbose)
-    : root_(std::filesystem::canonical(bundle_root)), verbose_(verbose) {
+    : root_(std::filesystem::canonical(bundle_root)), verbose_(verbose),
+      collect_timings_(verbose) {
   const json manifest = read_json(root_ / "bundle.json");
   const json plan = read_json(root_ / "plan.json");
 
@@ -330,7 +331,7 @@ const std::vector<float>& Plan::execute() {
   for (const auto& step : steps_) {
     const auto started = Clock::now();
     run_step(step);
-    if (verbose_)
+    if (collect_timings_)
       timings_.push_back(std::string(opcode_name(step.opcode)) + ":" +
                          (step.graph.empty() ? step.out : step.graph) + "=" +
                          std::to_string(elapsed_ms(started)));
