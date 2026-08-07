@@ -119,6 +119,7 @@ ACT_SPEC = PolicySpec(
         verify_entry="polima.policies.act.graphs:verify_chain",
         fixture_entry="polima.policies.act.graphs:write_fixtures",
         normalization_entry="polima.export.normalization:from_lerobot_checkpoint",
+        fixture_file="act_fixture.npz",
         verify_atol=1e-4,
         verify_rtol=1e-3,
         graphs=(

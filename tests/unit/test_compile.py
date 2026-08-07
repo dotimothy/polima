@@ -393,3 +393,37 @@ def test_tensor_module_imports_without_afe():
     import polima.compile.tensor as module
 
     assert not hasattr(module, "afe")
+
+
+# ------------------------------------------------------------------ cli wiring
+
+
+def test_checkpoint_without_a_build_dir_is_rejected(capsys):
+    from polima.cli import compile as compile_cli
+
+    assert compile_cli.run(["--checkpoint", "/some/ckpt"]) == 2
+    assert "--build-dir" in capsys.readouterr().err
+
+
+def test_import_legacy_and_build_dir_are_mutually_exclusive(capsys):
+    from polima.cli import compile as compile_cli
+
+    assert compile_cli.run(["--import-legacy", "/a", "--build-dir", "/b"]) == 2
+    assert "not both" in capsys.readouterr().err
+
+
+def test_no_arguments_lists_the_choices(capsys):
+    from polima.cli import compile as compile_cli
+
+    assert compile_cli.run([]) == 2
+    error = capsys.readouterr().err
+    assert "--build-dir" in error and "--import-legacy" in error
+
+
+def test_import_legacy_still_needs_no_compiler():
+    """Phase 1a depends on this path running where afe does not exist."""
+    from polima.cli import compile as compile_cli
+
+    assert compile_cli.needs_capability(["--import-legacy", "/x"]) is None
+    assert compile_cli.needs_capability(["--build-dir", "/x"]) == "compile"
+    assert compile_cli.needs_capability(["--checkpoint", "/x"]) == "compile"

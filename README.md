@@ -109,7 +109,7 @@ the real board rather than asserted:
 |---|---|---|
 | `polima doctor` / `data` / `list` | working | |
 | `polima-deploy` / `polima-run` | working | 20.8 ms on the SoM, cosine 0.999990 vs PyTorch — 24% faster than the hand-written `act_llima` at 27.0 ms |
-| `polima-compile` | working | recompiles all six ACT ELFs **byte for byte** from the checkpoint's ONNX, yielding the same content-addressed bundle id as the one deployed ([docs/compile.md](docs/compile.md)) |
+| `polima-compile` | working | checkpoint → ONNX → ELF → bundle reproduces **byte for byte**, landing on the same content-addressed bundle id as the one deployed ([export](docs/export.md), [compile](docs/compile.md)) |
 | `polima-train` | Phase 1c | |
 | `polima-robot` | Phase 1d | |
 | SmolVLA / GR00T | Phases 4–5 | |
@@ -117,4 +117,11 @@ the real board rather than asserted:
 The compile stage replaces three divergent copies of
 `sima_compile_onnx_tensors.py` (518 lines) plus two per-policy controllers with
 one driver over `PolicySpec.compile.graphs`, so adding a policy needs no
-controller at all.
+controller at all. The export stage splits `export_act_modalix.py` so that only
+the policy's own graph decomposition needs torch.
+
+```bash
+polima compile --checkpoint <ckpt> --build-dir <dir>   # export, compile, pack
+polima compile --build-dir <dir>                       # recompile what changed
+polima compile --import-legacy <dir>                   # adopt an existing tree
+```

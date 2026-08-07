@@ -51,11 +51,18 @@ def run(argv: list[str], parent: argparse.Namespace | None = None) -> int:
     )
     parser.add_argument("--build-dir", metavar="DIR",
                         help="build tree holding onnx/ and calibration/ to compile")
+    parser.add_argument("--checkpoint", metavar="PATH",
+                        help="export this checkpoint into --build-dir first")
+    parser.add_argument("--dataset-root", metavar="PATH",
+                        help="override the dataset named in the checkpoint")
+    parser.add_argument("--calibration-samples", type=int, default=8)
+    parser.add_argument("--skip-verify", action="store_true",
+                        help="skip the onnxruntime-vs-PyTorch check after export")
     parser.add_argument("--graph", action="append", metavar="NAME",
                         help="compile only this graph (repeatable)")
     parser.add_argument("--force", action="store_true",
                         help="recompile even when the content key is unchanged")
-    parser.add_argument("--stop-after", choices=("compile", "pack"), default="pack")
+    parser.add_argument("--stop-after", choices=("export", "compile", "pack"), default="pack")
     parser.add_argument("--output-root", default=None, help="where bundles are written")
     parser.add_argument("--dataset", default=None, help="override the dataset name in the id")
     parser.add_argument("--steps", type=int, default=None)
@@ -75,6 +82,11 @@ def run(argv: list[str], parent: argparse.Namespace | None = None) -> int:
 
     if args.build_dir:
         return _compile(args, config, output_root, dry_run)
+
+    if args.checkpoint:
+        print("polima-compile: --checkpoint also needs --build-dir, naming where "
+              "the exported graphs and ELFs go", file=sys.stderr)
+        return 2
 
     if not args.import_legacy:
         print(
@@ -97,6 +109,11 @@ def _compile(args, config, output_root: Path, dry_run: bool) -> int:
 
     spec = get_policy(args.policy)
     build_dir = Path(args.build_dir).resolve()
+
+    if args.checkpoint:
+        code = _export(args, spec, build_dir, dry_run)
+        if code or args.stop_after == "export":
+            return code
 
     try:
         compiler_python = require_compiler_python(config)
@@ -142,6 +159,52 @@ def _compile(args, config, output_root: Path, dry_run: bool) -> int:
     # A freshly compiled tree has the same shape as a legacy one -- that is
     # deliberate (see Driver's docstring), so the Phase-1a packer takes it as is.
     return _pack(args, build_dir, output_root)
+
+
+def _export(args, spec, build_dir: Path, dry_run: bool) -> int:
+    """Checkpoint -> onnx/ + calibration/ + fixtures, under the training env.
+
+    Needs torch and lerobot, which the compiler venv does not have -- so unlike
+    the compile stage this runs in-process, and fails with a clear message rather
+    than an ImportError if it is invoked from the wrong interpreter.
+    """
+    if dry_run:
+        print(f"  [dry-run] export {args.checkpoint} -> {build_dir}")
+        return 0
+
+    try:
+        from polima.export.driver import export
+    except ImportError as error:      # pragma: no cover - environment dependent
+        print(f"polima-compile: export needs torch + lerobot ({error}).\n"
+              "  Run under the `act` conda env, or compile a build tree that "
+              "already has onnx/ with --build-dir alone.", file=sys.stderr)
+        return 2
+
+    print(table.section(f"export {spec.name} from {Path(args.checkpoint).name}"))
+    result = export(
+        spec, args.checkpoint, build_dir,
+        dataset_root=args.dataset_root,
+        calibration_samples=args.calibration_samples,
+        verify=not args.skip_verify,
+    )
+    print(f"  {len(result.graphs)} graph(s), {result.calibration_samples} "
+          f"calibration sample(s), {result.duration_s:.0f}s")
+    print(f"  dataset   {result.dataset_root}")
+
+    report = result.verification
+    if report is None:
+        print("  verify    skipped")
+        return 0
+    verdict = "PASS" if report["ok"] else "FAIL"
+    print(f"  verify    {verdict}  max_abs={report['max_abs']:.3e} "
+          f"mean_abs={report['mean_abs']:.3e} (atol={report['atol']})")
+    if not report["ok"]:
+        print("\npolima-compile: the ONNX chain does not match PyTorch, so "
+              "compiling it would bake in the error.\n"
+              "  This is an export bug, not a quantization one -- nothing has "
+              "been quantized yet.", file=sys.stderr)
+        return 1
+    return 0
 
 
 def _pack(args, build_dir: Path, output_root: Path) -> int:

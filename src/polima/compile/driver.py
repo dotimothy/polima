@@ -258,12 +258,11 @@ class Driver:
                 )
                 continue
 
-            published = self.publish(graph, elf)
+            self.publish(graph, elf)
             outcome = GraphResult(name, "compiled", precision=precision, elf=str(elf),
                                   key=key, duration_s=time.monotonic() - started,
                                   attempts=attempts)
             self._record(outcome)
-            _ = published
             return outcome
 
         return GraphResult(name, "failed", key=key, attempts=attempts,

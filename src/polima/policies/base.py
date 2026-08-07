@@ -123,6 +123,11 @@ class DatasetContract:
     camera_keys: tuple[str, ...]
     camera_shape: tuple[int, int, int]            # HWC, as stored in meta/info.json
     fps: int
+    #: LeRobot feature names. Standard across every policy here, but named rather
+    #: than hardcoded because export and normalization both index by them, and a
+    #: dataset that renamed them would otherwise fail deep inside torch.
+    state_key: str = "observation.state"
+    action_key: str = "action"
     codebase_version: str = "v3.0"
     single_task: bool = True                      # False => language-conditioned
     task_canonicalizer: str | None = None         # dotted path
@@ -217,6 +222,11 @@ class CompilePlan:
     verify_entry: str | None = None
     fixture_entry: str | None = None
     normalization_entry: str | None = None
+    #: Reference tensors written by `fixture_entry` and read back by the verify
+    #: step and by bundle packing. Named here so the generic export driver has no
+    #: policy-specific filename in it; ACT keeps its legacy `act_fixture.npz`
+    #: because existing build trees on disk use that name.
+    fixture_file: str = "fixture.npz"
     verify_atol: float = 1e-4
     verify_rtol: float = 1e-3
 

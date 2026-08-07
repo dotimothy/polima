@@ -170,8 +170,14 @@ class EncoderStemLayer(nn.Module):
         latent = self.latent(
             torch.zeros(batch, self.latent_dim, dtype=state.dtype, device=state.device)
         )
+        # Keep this as its own statement. Inlining it into the cat below is
+        # numerically identical but emits the state Gemm *after* the latent's
+        # Unsqueeze instead of before it, because torch.onnx traces in evaluation
+        # order. The graph is equivalent and the ELF is not byte-identical, which
+        # breaks the reproduction check in docs/compile.md.
+        state_token = self.state(state)
         hidden = torch.cat(
-            [latent.unsqueeze(1), self.state(state).unsqueeze(1), camera0, camera1], dim=1
+            [latent.unsqueeze(1), state_token.unsqueeze(1), camera0, camera1], dim=1
         )
         output = self.layer(hidden.transpose(0, 1), pos_embed=self.position.transpose(0, 1))
         return output.transpose(0, 1)
@@ -403,6 +409,9 @@ def export_all(output: Path, modules: dict[str, nn.Module], samples: list[dict],
 # ------------------------------------------------------------------ fixtures
 
 
+FIXTURE_FILE = "act_fixture.npz"
+
+
 def write_fixtures(output: Path, sample: dict, trace_value: dict,
                    image_keys: Sequence[str], postprocessor) -> None:
     """The npz the host smoke test uses, and the raw `.f32` the board reads.
@@ -415,7 +424,7 @@ def write_fixtures(output: Path, sample: dict, trace_value: dict,
     """
     raw_action = postprocessor(trace_value["action"]).detach().cpu().numpy()
     np.savez(
-        output / "act_fixture.npz",
+        output / FIXTURE_FILE,
         state=sample["observation.state"].numpy(),
         camera0=sample[image_keys[0]].numpy(),
         camera1=sample[image_keys[1]].numpy(),
@@ -437,17 +446,33 @@ def write_fixtures(output: Path, sample: dict, trace_value: dict,
 
 
 def verify_chain(onnx_dir: Path, fixture_path: Path, report_path: Path,
-                 atol: float = 1e-4, rtol: float = 1e-3) -> dict:
+                 atol: float = 1e-4, rtol: float = 1e-3,
+                 stage_dir: Path | None = None) -> dict:
     """Replay the six graphs under onnxruntime and compare against PyTorch.
 
     This runs before anything is compiled, so a mismatch here is an export bug
     rather than a quantization one. Separating the two is the entire value: once
     the ONNX chain matches PyTorch, any later drift is attributable to the MLA.
+
+    `stage_dir` also dumps every graph's input and output. Those are what turn
+    "the actions are wrong" into "graph 3 is wrong": the board can replay one ELF
+    against its recorded input and compare. The legacy build trees carried these
+    files, but they came from a separate devkit validation run rather than from
+    the export, so a freshly built tree silently lacked them. Every value here is
+    already computed, so writing them costs nothing.
+
+    Note these are **onnxruntime** values, unlike `expected_normalized_actions.f32`
+    which is PyTorch. See docs/export.md -- the two differ by ~1.4e-06.
     """
     import onnxruntime as ort
 
     def session(path: Path):
         return ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+
+    def dump(name: str, array: np.ndarray) -> None:
+        if stage_dir is not None:
+            stage_dir.mkdir(parents=True, exist_ok=True)
+            np.ascontiguousarray(array, dtype="<f4").tofile(stage_dir / f"{name}.f32")
 
     fixture = np.load(fixture_path)
     vision = session(onnx_dir / "vision_backbone.onnx")
@@ -455,18 +480,28 @@ def verify_chain(onnx_dir: Path, fixture_path: Path, report_path: Path,
         vision.run(None, {"image": fixture[f"camera{i}"].astype(np.float32)})[0]
         for i in range(2)
     ]
+    for index, tokens in enumerate(cameras):
+        dump(f"vision_output_{index}", tokens)
+
     packed = np.zeros((1, 1, STEM_TOKENS, HIDDEN), np.float32)
     packed[:, :, 0, :STATE_DIM] = fixture["state"]
     packed[:, :, 1:1 + CAMERA_TOKENS] = cameras[0]
     packed[:, :, 1 + CAMERA_TOKENS:1 + 2 * CAMERA_TOKENS] = cameras[1]
 
+    dump("encoder_layer_00_stem_input", packed)
     hidden = session(onnx_dir / "encoder_layer_00_stem.onnx").run(
         None, {"stem_input": packed})[0]
+    dump("encoder_layer_00_stem_output", hidden)
     for index in range(1, 4):
+        dump(f"encoder_layer_{index:02d}_input", hidden)
         hidden = session(onnx_dir / f"encoder_layer_{index:02d}.onnx").run(
             None, {"hidden": hidden})[0]
-    action = session(onnx_dir / "decoder_action_tail.onnx").run(
-        None, {"hidden": hidden})[0][:, 0, :, :ACTION_DIM]
+        dump(f"encoder_layer_{index:02d}_output", hidden)
+
+    dump("decoder_action_tail_input", hidden)
+    padded = session(onnx_dir / "decoder_action_tail.onnx").run(None, {"hidden": hidden})[0]
+    dump("decoder_action_tail_output", padded)
+    action = padded[:, 0, :, :ACTION_DIM]
 
     reference = fixture["normalized_action"].astype(np.float32)
     difference = np.abs(action - reference)

@@ -53,6 +53,13 @@ CORE_MODULES = (
     "polima.compile.toolchain",
     "polima.compile.driver",
     "polima.compile.tensor",
+    # Likewise the export driver: it resolves torch-dependent code by dotted
+    # string, so the driver itself must import without torch. Only
+    # `polima.policies.<name>.graphs` may depend on it, and that is never listed
+    # here.
+    "polima.export.driver",
+    "polima.export.samples",
+    "polima.export.normalization",
 )
 
 COMPILER_BIN_CANDIDATES = toolchain.SEARCH_PATH
