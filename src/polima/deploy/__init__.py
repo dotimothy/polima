@@ -63,7 +63,7 @@ def deploy(
     *,
     port: int | None = None,
     build: bool = True,
-    start_service: bool = True,
+    start_service: bool = False,
     activate: bool = True,
     force: bool = False,
     verbose_server: bool = False,
@@ -152,7 +152,7 @@ def deploy(
             report.service = status
             report.record("service", "ok", pid=status.pid, port=resolved_port)
         else:
-            report.record("service", "skipped", reason="--no-start")
+            report.record("service", "skipped", reason="not requested (use --start)")
 
     report.duration_s = time.time() - report.started_at
     return report

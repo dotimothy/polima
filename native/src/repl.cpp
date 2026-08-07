@@ -18,6 +18,7 @@
 
 #include "polima/lineedit.hpp"
 #include "polima/plan.hpp"
+#include "polima/service.hpp"
 #include "polima/socket.hpp"
 
 namespace polima {
@@ -115,7 +116,8 @@ void print_help() {
       "  stages              per-step timings from the last run\n"
       "  check               compare against the bundle's expected output\n"
       "  info                what is loaded: graphs, buffers, wire\n"
-      "  unload              free the model and its MLA buffers\n"
+      "  unload              free the model, and stop the server holding the MLA\n"
+      "  server [stop|start] show or control polima_server\n"
       "  save <file>         write the last result as float32\n"
       "  help, quit\n"
       "\n  arrows for history and cursor, tab to complete, Ctrl-C to abandon\n"
@@ -191,11 +193,13 @@ int repl(const fs::path& store, const std::string& preselect, bool verbose) {
     std::cout << "\n";
   };
 
+  const fs::path root = store.parent_path();
+
   install_interrupt_handler();
   LineEditor editor;
   const std::vector<std::string> commands = {
-      "models", "use", "unload", "run", "bench", "stages", "check", "info",
-      "save", "help", "quit"};
+      "models", "use", "unload", "server", "run", "bench", "stages", "check",
+      "info", "save", "help", "quit"};
   auto refresh_completions = [&]() {
     std::vector<std::string> words = commands;
     for (const auto& entry : entries)
@@ -321,8 +325,60 @@ int repl(const fs::path& store, const std::string& preselect, bool verbose) {
         continue;
       }
 
+      if (command == "server") {
+        const auto state = server_state(root);
+        const std::string action = words.size() > 1 ? words[1] : "";
+        if (action.empty()) {
+          std::cout << (state.running ? "  running, pid " + std::to_string(state.pid)
+                                      : std::string("  not running"))
+                    << "\n  current   " << (state.bundle.empty() ? "-" : state.bundle) << "\n";
+        } else if (action == "stop") {
+          std::cout << (stop_server(root) ? "  stopped\n" : "  was not running\n");
+        } else if (action == "start") {
+          if (state.running) { std::cout << "  already running (pid " << state.pid << ")\n"; }
+          else if (plan == nullptr) {
+            std::cout << "  `use <n>` first -- start serves the loaded model\n";
+          } else {
+            const int started =
+                start_server(root, store / loaded, plan->wire().default_port);
+            std::cout << (started ? "  started pid " + std::to_string(started) + " on port " +
+                                        std::to_string(plan->wire().default_port) + "\n"
+                                  : std::string("  failed to start; see var/log/server.log\n"));
+          }
+        } else {
+          std::cout << "  usage: server [stop|start]\n";
+        }
+        continue;
+      }
+
       if (command == "unload") {
-        if (plan == nullptr) { std::cout << "  nothing loaded\n"; continue; }
+        // The session and the server are separate processes on one accelerator,
+        // so freeing only this process's models leaves the MLA just as busy.
+        // Stopping the server is how a served model is unloaded: polima_server
+        // holds its Plan for its whole life on purpose, because a server that
+        // can drop its model mid-request is worse than one you restart.
+        const auto state = server_state(root);
+        if (state.running) {
+          std::string answer;
+          // Confirm: this can be a robot's policy server, and a stopped policy
+          // is an arm that stops taking commands.
+          if (words.size() > 1 && (words[1] == "-y" || words[1] == "--yes")) {
+            answer = "y";
+          } else {
+            editor.read("  polima_server (pid " + std::to_string(state.pid) +
+                            ") is serving " +
+                            (state.bundle.empty() ? "a bundle" : state.bundle) +
+                            " -- stop it too? [y/N] ",
+                        answer);
+          }
+          if (!answer.empty() && (answer[0] == 'y' || answer[0] == 'Y')) {
+            std::cout << (stop_server(root) ? "  stopped the server\n"
+                                            : "  server was already gone\n");
+          } else {
+            std::cout << "  left the server running; it still holds the MLA\n";
+          }
+        }
+        if (plan == nullptr) { std::cout << "  nothing loaded here\n"; continue; }
         // Runner's destructor frees each model and both MLA buffers; dropping
         // the last Plan also disconnects the runtime. Explicit because the only
         // other way to release the MLA was to quit the session.

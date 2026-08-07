@@ -7,10 +7,13 @@ cost real debugging time on hardware.
 
 from __future__ import annotations
 
+import inspect
+
 import numpy as np
 import pytest
 
 from polima.config.base import BoardConfig
+from polima.deploy import deploy
 from polima.deploy.build import source_hash
 from polima.deploy.smoke import (
     DEFAULT_COSINE_MIN,
@@ -22,6 +25,10 @@ from polima.deploy.smoke import (
 
 
 # ------------------------------------------------------------------- config
+
+
+def test_deploy_does_not_start_service_by_default():
+    assert inspect.signature(deploy).parameters["start_service"].default is False
 
 
 def test_board_paths():

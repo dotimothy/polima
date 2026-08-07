@@ -1,4 +1,4 @@
-"""`polima-deploy` -- push a bundle to a Modalix board and serve it."""
+"""`polima-deploy` -- push a bundle to a Modalix board, serving only on request."""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ def run(argv: list[str], parent: argparse.Namespace | None = None) -> int:
     parser.add_argument("--port", type=int, default=None)
     parser.add_argument("--bundles-root", default=None)
     parser.add_argument("--no-build", action="store_true", help="skip the on-board cmake build")
-    parser.add_argument("--no-start", action="store_true", help="deploy without starting")
+    parser.add_argument("--start", action="store_true", help="start serving after deployment")
     parser.add_argument("--no-activate", action="store_true", help="do not move `current`")
     parser.add_argument("--force", action="store_true", help="re-transfer and rebuild")
     parser.add_argument("--verbose-server", action="store_true", help="per-stage server timings")
@@ -60,7 +60,7 @@ def run(argv: list[str], parent: argparse.Namespace | None = None) -> int:
     report = run_deploy(
         bundle, board, port=port,
         build=not args.no_build,
-        start_service=not args.no_start,
+        start_service=args.start,
         activate=not args.no_activate,
         force=args.force,
         verbose_server=args.verbose_server,

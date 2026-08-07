@@ -59,7 +59,7 @@ def run(argv: list[str], parent: argparse.Namespace | None = None) -> int:
     if not client.ping():
         print(
             f"polima-run: nothing listening on {host}:{port}\n"
-            f"  start it with: polima-deploy --bundle {bundle.bundle_id} --port {port}",
+            f"  start it with: polima-deploy --bundle {bundle.bundle_id} --port {port} --start",
             file=sys.stderr,
         )
         return 2

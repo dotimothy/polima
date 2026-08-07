@@ -124,6 +124,8 @@ the policy's own graph decomposition needs torch.
 polima compile --checkpoint <ckpt> --build-dir <dir>   # export, compile, pack
 polima compile --build-dir <dir>                       # recompile what changed
 polima compile --import-legacy <dir>                   # adopt an existing tree
+polima deploy --bundle <bundle>                        # deploy only; does not serve
+polima deploy --bundle <bundle> --start                # explicitly start serving
 ```
 
 ### On the board

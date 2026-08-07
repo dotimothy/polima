@@ -38,7 +38,7 @@ endif()
 # add native/third_party/ and point this at it.
 find_package(nlohmann_json QUIET)
 
-add_library(polima_core STATIC src/plan.cpp src/repl.cpp src/lineedit.cpp)
+add_library(polima_core STATIC src/plan.cpp src/repl.cpp src/lineedit.cpp src/service.cpp)
 target_include_directories(polima_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include
   ${JSONCPP_INCLUDE_DIR}
