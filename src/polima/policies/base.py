@@ -345,6 +345,31 @@ class RobotSpec:
     aggregate_fn: str = "weighted_average"
     task_string: str | None = None
     image_preprocessor: str | None = None         # dotted path; None => identity
+    #: Camera pixel format. MJPG is not cosmetic: two 640x480@30 USB cameras on
+    #: one controller exceed the bus budget in uncompressed YUYV, so the stream
+    #: silently drops to a lower rate. Both legacy launchers were fixed to pass
+    #: `fourcc: MJPG` in --robot.cameras; PoLiMa must emit it too or the robot
+    #: client regresses in a way that only shows up as degraded control.
+    camera_fourcc: str = "MJPG"
+    #: Whether `polima robot` offers --calibrate (backs up the existing
+    #: calibration, then runs lerobot-calibrate).
+    supports_calibrate: bool = True
+    calibration_id: str = "so-arm101"
+
+    def camera_config(self, devices: Mapping[str, str], fps: int | None = None) -> str:
+        """Render lerobot's --robot.cameras draccus blob.
+
+        One place builds this string; the legacy stacks each hand-wrote it, which
+        is how the MJPG fix had to be applied twice.
+        """
+        rate = fps or self.default_fps
+        entries = ", ".join(
+            f"{key}: {{type: opencv, index_or_path: '{devices[key]}', "
+            f"width: 640, height: 480, fps: {rate}, fourcc: {self.camera_fourcc}}}"
+            for key, _ in self.camera_roles
+            if key in devices
+        )
+        return "{ " + entries + "}"
 
     @property
     def camera_keys(self) -> tuple[str, ...]:

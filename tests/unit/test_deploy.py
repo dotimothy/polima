@@ -136,3 +136,37 @@ def test_summary_is_readable():
     values = np.ones(10, dtype=np.float32)
     assert "PASS" in compare("a", values, values).summary()
     assert "FAIL" in compare("b", values, values * 9).summary()
+
+
+# ------------------------------------------------------- carry-forward fixes
+
+
+def test_camera_config_emits_mjpg():
+    """Two 640x480@30 USB cameras exceed the bus budget in uncompressed YUYV.
+
+    Both legacy launchers were fixed to pass `fourcc: MJPG`; regressing this
+    degrades control silently, so it is pinned here. See docs/carry-forward.md.
+    """
+    from polima.policies.act import ACT_SPEC
+
+    blob = ACT_SPEC.robot.camera_config(
+        {"overhead": "/dev/v4l/by-id/usb-046d_HD_Pro_Webcam_C920-video-index0",
+         "wrist": "/dev/v4l/by-id/usb-Sonix_CAM1-video-index0"}
+    )
+    assert blob.count("fourcc: MJPG") == 2
+    assert "overhead:" in blob and "wrist:" in blob
+    assert "width: 640" in blob and "height: 480" in blob
+    assert "fps: 30" in blob
+
+
+def test_camera_config_honours_fps_override():
+    from polima.policies.act import ACT_SPEC
+
+    assert "fps: 15" in ACT_SPEC.robot.camera_config({"overhead": "/dev/x"}, fps=15)
+
+
+def test_camera_config_skips_absent_devices():
+    from polima.policies.act import ACT_SPEC
+
+    blob = ACT_SPEC.robot.camera_config({"overhead": "/dev/x"})
+    assert "overhead:" in blob and "wrist:" not in blob
