@@ -92,7 +92,7 @@ class Capabilities:
         needs = {
             "train": "torch + lerobot (conda env `act`); install with polima[host]",
             "compile": "the SiMa model-compiler venv (afe, onnx, onnxsim); "
-                       "run under $MODEL_COMPILER_BIN/python or install polima[compile]",
+                       "set MODEL_COMPILER_BIN=/path/to/model-compiler/bin",
             "deploy": "ssh and rsync on PATH",
             "run": "numpy (always available) -- this should not fail",
             "robot": "flask + opencv + lerobot; install with polima[robot]",
@@ -129,9 +129,17 @@ def check(command: str, argv: list[str], module: object = None) -> str | None:
 def detect() -> Capabilities:
     from shutil import which
 
+    from polima.compile.toolchain import find_compiler_bin
+
     board = is_board()
     can_train = _installed("torch") and _installed("lerobot")
-    can_compile = _installed("afe") and _installed("onnx")
+    # Compiling does not need afe *here*: `polima compile` runs the compiler as a
+    # subprocess under its own venv, because that venv has afe but no torch and
+    # the training env has torch but no afe -- they can never be one interpreter.
+    # So the real question is whether that venv is discoverable. Requiring an
+    # in-process afe would refuse a compile that works. It is still accepted as
+    # an alternative, since inside the SDK container afe *is* importable here.
+    can_compile = find_compiler_bin() is not None or (_installed("afe") and _installed("onnx"))
     can_deploy = bool(which("ssh") and which("rsync"))
     can_robot = _installed("flask") and _installed("cv2")
 

@@ -96,7 +96,7 @@ copy that can drift.
 **In PoLiMa:** one `robot/camera_focus_config.json` on the board, referenced by
 config rather than duplicated per policy.
 
-## Compiled stages must be reusable across runs   [Phase 1b]
+## Compiled stages must be reusable across runs   [DONE]
 
     SmolVLA/scripts/compile_deploy_smolvla_som.sh   --reuse-vision-dir
 
@@ -112,11 +112,14 @@ The flag skips the compile and `rsync`s a previously unpacked
 move the *existence check* for that stage, since `$VISION_ONNX` need not exist
 when the compiled output is being reused.
 
-**In PoLiMa:** this is a general property, not a SmolVLA quirk -- ACT's vision
-backbone has the same character. The compile driver should key each stage by a
-content hash of (onnx, calibration input, compile flags) and skip stages whose
-key is unchanged, so reuse is automatic rather than a manual flag. That is the
-same content-addressing already used for bundles and for the native build skip.
+**In PoLiMa:** `polima/compile/driver.py::Driver.stage_key` keys each stage by a
+content hash of (onnx, calibration data, compile flags, ModelSDK version) and
+skips stages whose key is unchanged, so reuse is automatic rather than a manual
+flag -- the same content-addressing already used for bundles and the native
+build skip. This generalizes rather than copies: ACT's vision backbone has the
+same character as SmolVLA's, and the key also closes a hole the legacy
+`--resume` had, where re-exporting a graph and re-running kept the stale ELF
+because only the ELF's *existence* was checked.
 
 ## Task strings belong to the dataset
 

@@ -102,13 +102,19 @@ Backups live outside `polima/` so removing the framework never takes the safety 
 
 ## Status
 
-Phase 0 complete: core, config, policy contract, ACT spec, data layer, CLI, doctor, 88 unit tests.
+169 unit tests, no hardware required. Both milestones so far are proven against
+the real board rather than asserted:
 
-| Stage | State |
-|---|---|
-| `polima doctor` / `data` / `list` | working |
-| `polima-deploy` / `polima-run` | Phase 1a |
-| `polima-compile` | Phase 1b |
-| `polima-train` | Phase 1c |
-| `polima-robot` | Phase 1d |
-| SmolVLA / GR00T | Phases 4–5 |
+| Stage | State | Proof |
+|---|---|---|
+| `polima doctor` / `data` / `list` | working | |
+| `polima-deploy` / `polima-run` | working | 20.8 ms on the SoM, cosine 0.999990 vs PyTorch — 24% faster than the hand-written `act_llima` at 27.0 ms |
+| `polima-compile` | working | recompiles all six ACT ELFs **byte for byte** from the checkpoint's ONNX, yielding the same content-addressed bundle id as the one deployed ([docs/compile.md](docs/compile.md)) |
+| `polima-train` | Phase 1c | |
+| `polima-robot` | Phase 1d | |
+| SmolVLA / GR00T | Phases 4–5 | |
+
+The compile stage replaces three divergent copies of
+`sima_compile_onnx_tensors.py` (518 lines) plus two per-policy controllers with
+one driver over `PolicySpec.compile.graphs`, so adding a policy needs no
+controller at all.

@@ -1,0 +1,395 @@
+"""The compile path's pure logic.
+
+The expensive part (afe) cannot run here, and is covered instead by the Phase-1b
+reproduction proof: driving these modules against the checkpoint that produced
+the deployed bundle regenerates `encoder_layer_01_stage1_mla.elf` byte for byte
+(sha256 09609ded..., 17189232 bytes).
+
+What is left is exactly the logic that unifying three divergent copies could get
+wrong quietly -- calibration shaping, resume keys, and command construction.
+"""
+
+from __future__ import annotations
+
+import json
+import tarfile
+
+import numpy as np
+import pytest
+
+from polima.compile import calibration as calib
+from polima.compile import mpk
+from polima.compile.driver import Driver, GraphResult
+from polima.compile.tensor import build_parser
+from polima.policies.registry import get_policy
+
+
+# --------------------------------------------------------------- calibration
+
+
+def test_npz_yields_one_sample_per_leading_index(tmp_path):
+    path = tmp_path / "c.npz"
+    np.savez(path, x=np.zeros((5, 2, 3), np.float32))
+    samples = calib.from_npz(path, ["x"], [(2, 3)], "NHWC")
+    assert len(samples) == 5
+    assert samples[0]["x"].shape == (2, 3)
+
+
+def test_rank4_nchw_is_transposed_to_nhwc(tmp_path):
+    """afe's quantizer wants NHWC calibration data regardless of model layout."""
+    path = tmp_path / "c.npz"
+    np.savez(path, image=np.zeros((2, 1, 3, 8, 9), np.float32))
+    sample = calib.from_npz(path, ["image"], [(1, 3, 8, 9)], "NCHW")[0]
+    assert sample["image"].shape == (1, 8, 9, 3)
+
+
+def test_rank4_nhwc_is_left_alone(tmp_path):
+    path = tmp_path / "c.npz"
+    np.savez(path, image=np.zeros((2, 1, 8, 9, 3), np.float32))
+    sample = calib.from_npz(path, ["image"], [(1, 8, 9, 3)], "NHWC")[0]
+    assert sample["image"].shape == (1, 8, 9, 3)
+
+
+def test_low_rank_tensors_are_never_transposed(tmp_path):
+    """This is the bug SmolVLA's copy existed to avoid: the curated helper
+    transposes unconditionally, which corrupts rank-2/3 action-side tensors."""
+    path = tmp_path / "c.npz"
+    np.savez(path, hidden=np.zeros((2, 601, 512), np.float32))
+    sample = calib.from_npz(path, ["hidden"], [(601, 512)], "NCHW")[0]
+    assert sample["hidden"].shape == (601, 512)
+
+
+def test_calibration_samples_are_contiguous(tmp_path):
+    path = tmp_path / "c.npz"
+    np.savez(path, image=np.zeros((1, 1, 3, 4, 5), np.float32))
+    sample = calib.from_npz(path, ["image"], [(1, 3, 4, 5)], "NCHW")[0]
+    assert sample["image"].flags["C_CONTIGUOUS"]
+
+
+def test_missing_array_names_the_file(tmp_path):
+    path = tmp_path / "c.npz"
+    np.savez(path, x=np.zeros((1, 2), np.float32))
+    with pytest.raises(KeyError, match="missing calibration arrays"):
+        calib.from_npz(path, ["x", "y"], [(2,), (2,)])
+
+
+def test_shape_without_a_sample_axis_is_rejected(tmp_path):
+    """(2, 3) where (N, 2, 3) is meant would otherwise quantize against a single
+    reshaped sample -- which succeeds, and produces a worse model."""
+    path = tmp_path / "c.npz"
+    np.savez(path, x=np.zeros((2, 3), np.float32))
+    with pytest.raises(ValueError, match="expected"):
+        calib.from_npz(path, ["x"], [(2, 3)])
+
+
+def test_inputs_must_agree_on_sample_count(tmp_path):
+    path = tmp_path / "c.npz"
+    np.savez(path, x=np.zeros((4, 2), np.float32), y=np.zeros((3, 2), np.float32))
+    with pytest.raises(ValueError, match="sample count"):
+        calib.from_npz(path, ["x", "y"], [(2,), (2,)])
+
+
+def test_empty_npz_is_rejected(tmp_path):
+    path = tmp_path / "c.npz"
+    np.savez(path, x=np.zeros((0, 2), np.float32))
+    with pytest.raises(ValueError, match="no calibration samples"):
+        calib.from_npz(path, ["x"], [(2,)])
+
+
+def test_raw_f32_splits_into_whole_samples(tmp_path):
+    path = tmp_path / "c.f32"
+    np.arange(24, dtype=np.float32).tofile(path)
+    samples = calib.from_raw_f32(path, ["prefix"], [(2, 3)])
+    assert len(samples) == 4
+    assert samples[1]["prefix"].tolist() == [[6.0, 7.0, 8.0], [9.0, 10.0, 11.0]]
+
+
+def test_raw_f32_rejects_a_partial_sample(tmp_path):
+    path = tmp_path / "c.f32"
+    np.arange(25, dtype=np.float32).tofile(path)
+    with pytest.raises(ValueError, match="whole number"):
+        calib.from_raw_f32(path, ["prefix"], [(2, 3)])
+
+
+def test_raw_f32_rejects_multi_input_graphs(tmp_path):
+    path = tmp_path / "c.f32"
+    np.arange(6, dtype=np.float32).tofile(path)
+    with pytest.raises(ValueError, match="exactly one input"):
+        calib.from_raw_f32(path, ["a", "b"], [(3,), (3,)])
+
+
+def test_random_matches_the_requested_shapes():
+    sample = calib.random(["x", "y"], [(2, 3), (4,)])[0]
+    assert sample["x"].shape == (2, 3) and sample["y"].shape == (4,)
+    assert sample["x"].dtype == np.float32
+
+
+def test_random_honours_int8_inputs():
+    sample = calib.random(["tokens"], [(4,)], types={"tokens": "int8"})[0]
+    assert sample["tokens"].dtype == np.int8
+
+
+def test_random_is_reproducible():
+    first = calib.random(["x"], [(3,)], seed=7)[0]["x"]
+    assert np.array_equal(first, calib.random(["x"], [(3,)], seed=7)[0]["x"])
+
+
+def test_build_dispatches_and_falls_back_to_random(tmp_path):
+    path = tmp_path / "c.npz"
+    np.savez(path, x=np.zeros((2, 3), np.float32))
+    assert len(calib.build("npz", path, ["x"], [(3,)])) == 2
+    assert len(calib.build("npz", None, ["x"], [(3,)])) == 1     # no path -> random
+    with pytest.raises(ValueError, match="unknown calibration kind"):
+        calib.build("guess", path, ["x"], [(3,)])
+
+
+# ---------------------------------------------------------------------- mpk
+
+
+def _archive(path, names):
+    with tarfile.open(path, "w:gz") as handle:
+        for name, payload in names.items():
+            info = tarfile.TarInfo(name)
+            data = payload.encode()
+            info.size = len(data)
+            import io
+
+            handle.addfile(info, io.BytesIO(data))
+
+
+def test_unpack_routes_files_by_suffix(tmp_path):
+    archive = tmp_path / "m_mpk.tar.gz"
+    _archive(archive, {"a/m.elf": "ELF", "a/m.so": "SO",
+                       "a/m.json": json.dumps({"model_info": {"path": "/build/m.so"}})})
+    root = mpk.unpack(archive, tmp_path / "out")
+    assert (root / "share" / "m.elf").read_text() == "ELF"
+    assert (root / "lib" / "m.so").read_text() == "SO"
+    assert (root / "etc" / "m.json").exists()
+
+
+def test_unpack_repoints_config_at_the_new_location(tmp_path):
+    archive = tmp_path / "m_mpk.tar.gz"
+    _archive(archive, {
+        "m.elf": "ELF",
+        "m.json": json.dumps({
+            "simaai__params": {"model_path": "/some/build/host/m.elf"},
+            "model_info": {"path": "/some/build/host/m.so"},
+        }),
+    })
+    root = mpk.unpack(archive, tmp_path / "out")
+    config = json.loads((root / "etc" / "m.json").read_text())
+    assert config["simaai__params"]["model_path"] == str(root / "share" / "m.elf")
+    assert config["model_info"]["path"] == str(root / "lib" / "m.so")
+
+
+def test_unpack_ignores_path_traversal(tmp_path):
+    archive = tmp_path / "m_mpk.tar.gz"
+    _archive(archive, {"../escape.elf": "NO", "m.elf": "ELF", "m.json": "{}"})
+    root = mpk.unpack(archive, tmp_path / "out")
+    assert not (tmp_path / "escape.elf").exists()
+    assert (root / "share" / "m.elf").exists()
+
+
+def test_unpack_rejects_an_archive_with_no_elf(tmp_path):
+    archive = tmp_path / "m_mpk.tar.gz"
+    _archive(archive, {"m.json": "{}"})
+    with pytest.raises(RuntimeError, match="usable model directory"):
+        mpk.unpack(archive, tmp_path / "out")
+
+
+def test_has_elf_detects_an_apu_fallback(tmp_path):
+    """A compile can exit 0 and produce an mpk with no ELF; both legacy
+    controllers check for this because the board failure is much later."""
+    with_elf = tmp_path / "a_mpk.tar.gz"
+    without = tmp_path / "b_mpk.tar.gz"
+    _archive(with_elf, {"a.elf": "ELF"})
+    _archive(without, {"b.json": "{}"})
+    assert mpk.has_elf(with_elf)
+    assert not mpk.has_elf(without)
+    assert not mpk.has_elf(tmp_path / "nonexistent.tar.gz")
+
+
+def test_find_locates_by_stem(tmp_path):
+    (tmp_path / "deep" / "nest").mkdir(parents=True)
+    target = tmp_path / "deep" / "nest" / "vision_backbone_mpk.tar.gz"
+    target.write_bytes(b"")
+    assert mpk.find(tmp_path, "vision_backbone") == target
+    assert mpk.find(tmp_path, "absent") is None
+
+
+# -------------------------------------------------------------------- driver
+
+
+def _driver(tmp_path, **kwargs) -> Driver:
+    return Driver(spec=get_policy("act"), build_dir=tmp_path,
+                  compiler_python="/nonexistent/python", **kwargs)
+
+
+def _write_inputs(driver: Driver, graph, onnx: bytes = b"onnx", calib_bytes: bytes = b"c"):
+    driver.onnx_path(graph.name).parent.mkdir(parents=True, exist_ok=True)
+    driver.onnx_path(graph.name).write_bytes(onnx)
+    path = driver.calibration_path(graph)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(calib_bytes)
+
+
+def test_argv_reproduces_the_legacy_invocation(tmp_path):
+    """compile_deploy_act_som.sh: bf16, per-graph layout, npz calibration,
+    tessellation, and a retained dir that is where the ELF is then read from."""
+    driver = _driver(tmp_path)
+    graph = get_policy("act").compile.graph("vision_backbone")
+    argv = driver.argv(graph, "bf16")
+    assert "--precision" in argv and argv[argv.index("--precision") + 1] == "bf16"
+    assert argv[argv.index("--model-layout") + 1] == "NCHW"
+    assert "--mla-tessellation" in argv
+    assert argv[argv.index("--calibration-npz") + 1].endswith("vision_backbone.npz")
+    assert argv[argv.index("--retain-compile-dir") + 1].endswith("retained/vision_backbone")
+
+
+def test_encoder_layers_compile_as_nhwc(tmp_path):
+    """Only the vision backbone is NCHW; the packed-token graphs are NHWC."""
+    driver = _driver(tmp_path)
+    for name in ("encoder_layer_00_stem", "encoder_layer_01", "decoder_action_tail"):
+        graph = get_policy("act").compile.graph(name)
+        argv = driver.argv(graph, "bf16")
+        assert argv[argv.index("--model-layout") + 1] == "NHWC"
+
+
+def test_stage_key_is_stable_for_unchanged_inputs(tmp_path):
+    driver = _driver(tmp_path)
+    graph = get_policy("act").compile.graph("encoder_layer_01")
+    _write_inputs(driver, graph)
+    assert driver.stage_key(graph) == driver.stage_key(graph)
+
+
+def test_stage_key_tracks_the_onnx(tmp_path):
+    driver = _driver(tmp_path)
+    graph = get_policy("act").compile.graph("encoder_layer_01")
+    _write_inputs(driver, graph)
+    before = driver.stage_key(graph)
+    driver.onnx_path(graph.name).write_bytes(b"re-exported")
+    assert driver.stage_key(graph) != before
+
+
+def test_stage_key_tracks_the_calibration_data(tmp_path):
+    """The legacy --resume only checked that an ELF existed, so re-exporting and
+    re-running silently kept the stale one."""
+    driver = _driver(tmp_path)
+    graph = get_policy("act").compile.graph("encoder_layer_01")
+    _write_inputs(driver, graph)
+    before = driver.stage_key(graph)
+    driver.calibration_path(graph).write_bytes(b"different samples")
+    assert driver.stage_key(graph) != before
+
+
+def test_stage_key_tracks_the_sdk_version(tmp_path):
+    """An afe upgrade changes code generation with every input byte-identical."""
+    graph = get_policy("act").compile.graph("encoder_layer_01")
+    first = _driver(tmp_path, sdk_version="2.1.0")
+    _write_inputs(first, graph)
+    assert first.stage_key(graph) != _driver(tmp_path, sdk_version="2.2.0").stage_key(graph)
+
+
+def test_stage_key_is_independent_of_the_build_location(tmp_path):
+    """So a relocated or renamed build tree still counts as unchanged."""
+    graph = get_policy("act").compile.graph("encoder_layer_01")
+    keys = []
+    for name in ("build_a", "build_b"):
+        driver = _driver(tmp_path / name)
+        _write_inputs(driver, graph)
+        keys.append(driver.stage_key(graph))
+    assert keys[0] == keys[1]
+
+
+def test_reuse_requires_the_elf_to_still_exist(tmp_path):
+    """A matching key with a deleted ELF must fall through to a real compile,
+    which under --dry-run reports `skipped` rather than `reused`."""
+    driver = _driver(tmp_path, dry_run=True)
+    graph = get_policy("act").compile.graph("encoder_layer_01")
+    _write_inputs(driver, graph)
+    driver._record(GraphResult(graph.name, "compiled", precision="bf16",
+                               elf=str(tmp_path / "gone.elf"), key=driver.stage_key(graph)))
+    assert driver.compile_graph(graph).status == "skipped"
+
+
+def test_reuse_hits_when_nothing_changed(tmp_path):
+    driver = _driver(tmp_path)
+    graph = get_policy("act").compile.graph("encoder_layer_01")
+    _write_inputs(driver, graph)
+    elf = tmp_path / "prebuilt.elf"
+    elf.write_bytes(b"\x7fELF")
+    driver._record(GraphResult(graph.name, "compiled", precision="bf16",
+                               elf=str(elf), key=driver.stage_key(graph)))
+    result = driver.compile_graph(graph)
+    assert result.status == "reused"
+    # and it is published where the bundle packer looks
+    published = tmp_path / "models_uncompressed" / graph.name / "share" / graph.elf_name
+    assert published.read_bytes() == b"\x7fELF"
+
+
+def test_force_defeats_reuse(tmp_path):
+    driver = _driver(tmp_path, force=True, dry_run=True)
+    graph = get_policy("act").compile.graph("encoder_layer_01")
+    _write_inputs(driver, graph)
+    elf = tmp_path / "prebuilt.elf"
+    elf.write_bytes(b"\x7fELF")
+    driver._record(GraphResult(graph.name, "compiled", precision="bf16",
+                               elf=str(elf), key=driver.stage_key(graph)))
+    assert driver.compile_graph(graph).status == "skipped"     # dry run, not reused
+
+
+def test_missing_onnx_points_at_the_export_stage(tmp_path):
+    driver = _driver(tmp_path)
+    graph = get_policy("act").compile.graph("encoder_layer_01")
+    result = driver.compile_graph(graph)
+    assert result.status == "failed" and "export" in result.note
+
+
+def test_select_rejects_an_unknown_graph(tmp_path):
+    from polima.compile.driver import CompileError
+
+    with pytest.raises(CompileError, match="unknown graph"):
+        _driver(tmp_path).select(["encoder_layer_99"])
+
+
+def test_select_preserves_plan_order(tmp_path):
+    chosen = _driver(tmp_path).select(["decoder_action_tail", "vision_backbone"])
+    assert [g.name for g in chosen] == ["vision_backbone", "decoder_action_tail"]
+
+
+def test_graph_result_ok_covers_reuse():
+    assert GraphResult("g", "compiled").ok
+    assert GraphResult("g", "reused").ok
+    assert not GraphResult("g", "failed").ok
+    assert not GraphResult("g", "skipped").ok
+
+
+# -------------------------------------------------------------- tensor CLI
+
+
+def test_tensor_cli_defaults_to_bf16_modalix():
+    args = build_parser().parse_args(["--model-path", "m.onnx", "--build-dir", "b"])
+    assert args.precision == "bf16"
+    assert args.device == "modalix"
+    assert args.model_layout == "NCHW"
+    assert not args.infer_shapes
+
+
+def test_tensor_cli_accepts_the_smolvla_surface():
+    """The SmolVLA copy's extra knobs must all still be expressible."""
+    args = build_parser().parse_args([
+        "--model-path", "m.onnx", "--build-dir", "b", "--device", "mlsoc",
+        "--calibration-raw-f32", "c.f32", "--input-shapes", "1,601,512",
+        "--input-types", "float32", "--no-compile", "--infer-shapes",
+        "--calib-method", "min_max", "--requant-mode", "tflite",
+        "--activation-precision", "bf16", "--weight-precision", "int8",
+    ])
+    assert args.device == "mlsoc" and args.no_compile and args.infer_shapes
+    assert args.activation_precision == "bf16" and args.weight_precision == "int8"
+
+
+def test_tensor_module_imports_without_afe():
+    """doctor and these tests import it in environments with no compiler."""
+    import polima.compile.tensor as module
+
+    assert not hasattr(module, "afe")

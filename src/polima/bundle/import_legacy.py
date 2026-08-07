@@ -221,8 +221,16 @@ def import_legacy(
     output_root: str | Path,
     dataset: str | None = None,
     steps: int | None = None,
+    source: str = "legacy-import",
 ) -> Bundle:
-    """Turn a legacy build tree into a PoLiMa bundle."""
+    """Turn a build tree into a PoLiMa bundle.
+
+    `source` records provenance in bundle.json. It defaults to `legacy-import`
+    because that is what this started as, but `polima compile` passes
+    `polima-compile` for a tree it built itself -- the packing is identical
+    either way (that is the point of keeping the tree layouts the same), and
+    mislabelling a fresh build as an import would make the record useless.
+    """
     build = detect(build_dir)
     log.info("importing %s build from %s", build.format, build.root)
 
@@ -241,7 +249,7 @@ def import_legacy(
             steps=steps if steps is not None else build.steps,
             checkpoint=build.checkpoint,
             fixtures=fixtures,
-            source="legacy-import",
+            source=source,
             legacy_source_dir=str(build.root),
             tool_versions=tool_versions,
         ),

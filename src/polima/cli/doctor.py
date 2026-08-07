@@ -29,6 +29,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from polima.compile import toolchain
 from polima.config.loader import load
 from polima.util import table
 from polima.util.paths import repo_root, symlink_report
@@ -44,13 +45,17 @@ CORE_MODULES = (
     "polima.policies.registry",
     "polima.data.episodes",
     "polima.data.contract",
+    # The compile modules belong here too: `polima.compile.tensor` runs *inside*
+    # the compiler venv, so it must import with numpy alone and reach afe only
+    # from within the functions that use it.
+    "polima.compile.calibration",
+    "polima.compile.mpk",
+    "polima.compile.toolchain",
+    "polima.compile.driver",
+    "polima.compile.tensor",
 )
 
-COMPILER_BIN_CANDIDATES = (
-    "$MODEL_COMPILER_BIN",
-    "~/sima-sdk-extensions/model-compiler/bin",
-    "/sdk-extensions/model-compiler/bin",
-)
+COMPILER_BIN_CANDIDATES = toolchain.SEARCH_PATH
 
 OPTIONAL_SKILLS = (
     "~/.codex/skills/sima-model-surgery/scripts/model_surgery_guard.py",
@@ -515,15 +520,8 @@ def _capture(argv: list[str], timeout: float = 60) -> str:
 
 
 def _find_compiler_bin(config) -> str | None:
-    explicit = getattr(config.paths, "model_compiler_bin", None)
-    candidates = [str(explicit)] if explicit else []
-    candidates += [os.environ.get("MODEL_COMPILER_BIN", "")]
-    candidates += [os.path.expanduser("~/sima-sdk-extensions/model-compiler/bin")]
-    candidates += ["/sdk-extensions/model-compiler/bin"]
-    for candidate in candidates:
-        if candidate and (Path(candidate) / "python").exists():
-            return candidate
-    return None
+    found = toolchain.find_compiler_bin(config)
+    return str(found) if found else None
 
 
 def _conda_python(env: str) -> str | None:
