@@ -366,6 +366,16 @@ def check_compiler(doc: Doctor, config) -> None:
         return
     doc.record(table.OK, "compiler bin", compiler_bin)
 
+    # Palette's activation is what puts the compiler's shared libraries on the
+    # loader path. Absent is normal for a host install and fatal in a container.
+    activation = toolchain.find_activation(compiler_bin)
+    doc.record(
+        table.OK if activation else table.SKIP,
+        toolchain.ACTIVATION_SCRIPT,
+        f"sourced from {activation}" if activation
+        else "not present -- fine unless afe fails on a missing library",
+    )
+
     python = str(Path(compiler_bin) / "python")
     version = _capture([python, "-c", "import sys;print(sys.version.split()[0])"]).strip()
     doc.record(table.OK if version else table.FAIL, "compiler python", version or "unusable")

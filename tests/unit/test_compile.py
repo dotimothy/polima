@@ -460,3 +460,52 @@ def test_mixed_precision_keeps_calibration():
 def test_int8_without_calibration_warns_about_drift():
     _, _, note = calib.plan("int8", "int8")
     assert "drift" in note
+
+
+# ----------------------------------------------- palette compiler activation
+
+
+def test_activation_is_sourced_and_filtered(tmp_path):
+    """Palette's activate-model-compiler is what puts the compiler's own shared
+    libraries on the loader path; without it `import afe` dies on a missing
+    libLLVM, which reads like a broken install rather than a missing step."""
+    from polima.compile.toolchain import activation_env, find_activation
+
+    script = tmp_path / "activate-model-compiler"
+    script.write_text(
+        'export LD_LIBRARY_PATH="/opt/mc/lib:${LD_LIBRARY_PATH}"\n'
+        "export MODEL_SDK_ROOT=/opt/mc\n"
+        "export UNRELATED=noise\n"
+    )
+    assert find_activation(tmp_path) == script
+
+    changed = activation_env(script)
+    assert changed["MODEL_SDK_ROOT"] == "/opt/mc"
+    assert changed["LD_LIBRARY_PATH"].startswith("/opt/mc/lib")
+    # Copying the whole environment would drag the subshell's PWD/SHLVL along
+    # and quietly undo the caller's own settings.
+    assert "UNRELATED" not in changed
+
+
+def test_absent_activation_is_not_an_error(tmp_path):
+    from polima.compile.toolchain import find_activation
+
+    assert find_activation(tmp_path) is None
+
+
+def test_a_failing_activation_yields_no_changes(tmp_path):
+    from polima.compile.toolchain import activation_env
+
+    script = tmp_path / "activate-model-compiler"
+    script.write_text("exit 1\n")
+    assert activation_env(script) == {}
+
+
+def test_compiler_env_keeps_its_own_settings_over_the_activation(tmp_path):
+    """The activation runs first so the explicit PATH prefix still wins."""
+    from polima.compile.toolchain import compiler_env
+
+    (tmp_path / "activate-model-compiler").write_text("export PATH=/only/this\n")
+    env = compiler_env(tmp_path)
+    assert env["PATH"].startswith(f"{tmp_path}:")
+    assert env["CUDA_VISIBLE_DEVICES"] == ""

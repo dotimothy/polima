@@ -134,14 +134,23 @@ def _compile(args, config, output_root: Path, dry_run: bool) -> int:
     if not dry_run and not version:
         from polima.util.proc import capture
 
+        from polima.compile.toolchain import ACTIVATION_SCRIPT, find_activation
+
         probe = capture([str(compiler_python), "-c", "import afe"], env=env)
         detail = probe.tail(3).strip() or "no output"
+        activation = find_activation(compiler_python.parent)
+        hint = (
+            f"  Sourced {activation} and it still fails."
+            if activation else
+            f"  No {ACTIVATION_SCRIPT} found. In the Palette `modelsdk` container\n"
+            "  that script puts the compiler's own libraries on the loader path;\n"
+            "  without it afe fails on a missing libLLVM."
+        )
         print(
             f"polima-compile: {compiler_python} cannot import afe.\n"
             f"  {detail}\n"
-            "  The model compiler runs in the Palette `modelsdk` environment; a\n"
-            "  different image may not carry the libraries it links against.\n"
-            "  Set MODEL_COMPILER_BIN to the right one, or run from that env.",
+            f"{hint}\n"
+            "  Set MODEL_COMPILER_BIN, or run from the modelsdk environment.",
             file=sys.stderr,
         )
         return 2

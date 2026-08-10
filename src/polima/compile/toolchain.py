@@ -49,6 +49,69 @@ def require_compiler_python(config=None) -> Path:
     return compiler_bin / "python"
 
 
+#: Palette ships this in the modelsdk container. Sourcing it is what puts the
+#: compiler's own shared libraries on the loader path -- without it `import afe`
+#: dies on a missing libLLVM, which reads like a broken install rather than a
+#: missing activation step.
+ACTIVATION_SCRIPT = "activate-model-compiler"
+
+#: Variables worth taking from the activation. Copying the whole environment
+#: would drag in the subshell's own PATH/PWD/SHLVL and quietly undo the caller's.
+ACTIVATION_VARS = (
+    "LD_LIBRARY_PATH", "PATH", "PYTHONPATH", "VIRTUAL_ENV",
+    "SIMA_SDK_ROOT", "MODEL_SDK_ROOT", "LD_PRELOAD",
+)
+
+
+def find_activation(compiler_bin: str | Path | None = None) -> Path | None:
+    """Locate `activate-model-compiler`, if this environment has one."""
+    from shutil import which
+
+    if compiler_bin:
+        candidate = Path(compiler_bin) / ACTIVATION_SCRIPT
+        if candidate.is_file():
+            return candidate
+    found = which(ACTIVATION_SCRIPT)
+    if found:
+        return Path(found)
+    for directory in ("/usr/local/bin", "/opt/bin", "/sdk-extensions"):
+        candidate = Path(directory) / ACTIVATION_SCRIPT
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def activation_env(script: str | Path) -> dict[str, str]:
+    """Source the activation in a subshell and return what it changed.
+
+    Reading the environment back rather than running every compile under
+    `bash -lc 'source ... && ...'` keeps the subprocess call sites unchanged --
+    and means the preflight, the version probe and the per-graph compiles all
+    get the same environment by construction rather than by remembering.
+    """
+    import os
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["bash", "-c", f"source {script} >/dev/null 2>&1 && env -0"],
+            capture_output=True, timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if result.returncode != 0:
+        return {}
+
+    changed: dict[str, str] = {}
+    for entry in result.stdout.decode("utf-8", "replace").split("\0"):
+        name, separator, value = entry.partition("=")
+        if not separator or name not in ACTIVATION_VARS:
+            continue
+        if os.environ.get(name) != value:
+            changed[name] = value
+    return changed
+
+
 def compiler_env(compiler_bin: str | Path, source_root: str | Path | None = None) -> dict[str, str]:
     """Environment for a compiler subprocess.
 
@@ -62,6 +125,14 @@ def compiler_env(compiler_bin: str | Path, source_root: str | Path | None = None
       overrides it when the GPU is genuinely wanted.
     """
     env = dict(os.environ)
+
+    # Apply the Palette activation first, so the explicit settings below win.
+    # Without it `import afe` fails on a missing shared library -- the compiler
+    # venv links against libraries only that activation puts on the loader path.
+    script = find_activation(compiler_bin)
+    if script is not None:
+        env.update(activation_env(script))
+
     env["PATH"] = f"{compiler_bin}:{env.get('PATH', '')}"
     env["CUDA_VISIBLE_DEVICES"] = env.get("MODEL_COMPILER_CUDA_VISIBLE_DEVICES", "")
     if source_root:
