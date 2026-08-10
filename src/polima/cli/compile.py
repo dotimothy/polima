@@ -127,6 +127,25 @@ def _compile(args, config, output_root: Path, dry_run: bool) -> int:
     env = compiler_env(compiler_python.parent, source_root=_src_root())
     version = sdk_version(compiler_python, env) if not dry_run else ""
 
+    # Preflight the compiler rather than discovering it is broken one graph in.
+    # The interpreter existing is not the same as afe working: the model-compiler
+    # venv is built for the Palette `modelsdk` container, and mounting it into a
+    # different image gets you a missing-shared-library error at import time.
+    if not dry_run and not version:
+        from polima.util.proc import capture
+
+        probe = capture([str(compiler_python), "-c", "import afe"], env=env)
+        detail = probe.tail(3).strip() or "no output"
+        print(
+            f"polima-compile: {compiler_python} cannot import afe.\n"
+            f"  {detail}\n"
+            "  The model compiler runs in the Palette `modelsdk` environment; a\n"
+            "  different image may not carry the libraries it links against.\n"
+            "  Set MODEL_COMPILER_BIN to the right one, or run from that env.",
+            file=sys.stderr,
+        )
+        return 2
+
     driver = Driver(spec=spec, build_dir=build_dir, compiler_python=compiler_python,
                     env=env, dry_run=dry_run, force=args.force, sdk_version=version)
 
