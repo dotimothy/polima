@@ -509,3 +509,40 @@ def test_compiler_env_keeps_its_own_settings_over_the_activation(tmp_path):
     env = compiler_env(tmp_path)
     assert env["PATH"].startswith(f"{tmp_path}:")
     assert env["CUDA_VISIBLE_DEVICES"] == ""
+
+
+# -------------------------------------------------------------- bin launcher
+
+
+def _launcher(name: str = "polima"):
+    from pathlib import Path
+
+    return Path(__file__).resolve().parents[2] / "bin" / name
+
+
+def test_launcher_runs_without_an_install():
+    """The Palette container is recreated and mounts the workspace at a
+    different path, so an editable install done on the host would bake in a
+    path that does not exist inside it."""
+    import subprocess
+
+    result = subprocess.run([str(_launcher()), "--version"],
+                            capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0
+    assert result.stdout.strip().startswith("polima ")
+
+
+def test_stage_symlinks_dispatch_on_their_name():
+    """`polima-deploy` must behave as `polima deploy`, matching pip's scripts."""
+    import subprocess
+
+    assert _launcher("polima-deploy").is_symlink()
+    result = subprocess.run([str(_launcher("polima-deploy")), "--help"],
+                            capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0
+    assert "polima-deploy" in result.stdout
+
+
+def test_every_stage_has_a_launcher():
+    for stage in ("compile", "deploy", "run", "robot", "doctor"):
+        assert _launcher(f"polima-{stage}").exists(), stage

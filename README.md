@@ -54,6 +54,15 @@ pip install -e "polima[host]"
 polima-doctor
 ```
 
+**Palette modelsdk container** — no install; the launcher resolves its own location, so it works at whatever path the workspace is mounted:
+
+```bash
+export PATH=/workspace/MLSandbox/polima/bin:$PATH
+polima compile --build-dir <dir>
+```
+
+`bin/polima` picks an interpreter that has numpy (the model compiler's own will do) and sources `activate-model-compiler` when present — without it `import afe` fails on a missing `libLLVM`.
+
 **Board**
 ```bash
 ssh sima@192.168.91.211

@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# polima, without an install.
+#
+# The Palette modelsdk container is recreated, and an editable install done on
+# the host would bake in a host path that does not exist inside it -- the
+# workspace is mounted somewhere else. This resolves its own location instead,
+# so the same file works on the host, in any container, at any mount point, and
+# keeps working while you edit src/.
+#
+#   export PATH=/workspace/MLSandbox/polima/bin:$PATH
+#   polima compile --build-dir ...
+#
+# Interpreter choice, in order: $POLIMA_PYTHON, the model compiler's python
+# (present wherever compiling happens, and it has numpy), then python3. The
+# umbrella CLI needs stdlib + numpy only; heavier stages re-enter the
+# interpreter that owns them as a subprocess.
+set -euo pipefail
+
+root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+export PYTHONPATH="$root/src${PYTHONPATH:+:$PYTHONPATH}"
+
+pick_python() {
+    if [[ -n "${POLIMA_PYTHON:-}" ]]; then echo "$POLIMA_PYTHON"; return; fi
+    local candidates=(
+        "${MODEL_COMPILER_BIN:-}/python"
+        /sdk-extensions/model-compiler/bin/python
+        "$HOME/sima-sdk-extensions/model-compiler/bin/python"
+    )
+    for candidate in "${candidates[@]}"; do
+        # Must actually have numpy: the compiler venv does, but a bare
+        # interpreter that merely exists would fail three frames deep instead.
+        if [[ -x "$candidate" ]] && "$candidate" -c "import numpy" >/dev/null 2>&1; then
+            echo "$candidate"; return
+        fi
+    done
+    echo "${PYTHON:-python3}"
+}
+
+# Invoked as polima-compile/-deploy/... via symlink? Dispatch on the name, so
+# both spellings work exactly as they do from a pip install.
+invoked="$(basename -- "${BASH_SOURCE[0]}")"
+stage=""
+if [[ "$invoked" == polima-* ]]; then stage="${invoked#polima-}"; fi
+
+if [[ -n "$stage" ]]; then
+    exec "$(pick_python)" -m polima.cli.main "$stage" "$@"
+fi
+exec "$(pick_python)" -m polima.cli.main "$@"
