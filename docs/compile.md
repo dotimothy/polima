@@ -55,6 +55,43 @@ to check, so it is the standing regression test for this path. It also
 establishes that afe compilation is deterministic given identical inputs, which
 is what makes the content-keyed resume below sound.
 
+### Reproduced again, from the Palette container
+
+The same check on a *second* checkpoint (`gewb_2_final`, the grey-eraser task),
+compiled inside the running Palette container rather than on the host, against an
+independent reference: the ELFs the legacy build had already deployed to the
+board.
+
+| graph | sha256 (first 16) | compile |
+|---|---|---|
+| `vision_backbone` | `c326e846fd3d73f8` | 112 s |
+| `encoder_layer_00_stem` | `885e0eff650e2197` | 61 s |
+| `encoder_layer_01` | `15d2ce815420bf42` | 60 s |
+| `encoder_layer_02` | `6b4b0c90538cf3dd` | 58 s |
+| `encoder_layer_03` | `cba658fa833f194b` | 58 s |
+| `decoder_action_tail` | `efea65bedcc31cf5` | 30 s |
+
+All six identical to `/media/nvme/polima/models/ACT_gewb_100000/`. So byte
+identity holds across checkpoints and across the host/container boundary, which
+is what makes the content-keyed resume safe to trust.
+
+### Running it in the Palette container
+
+The container is long-lived and already mounts the workspace and the compiler,
+so this is `docker exec`, not `docker run`:
+
+```bash
+docker exec -it <palette-container> bash -lc '
+  export PATH=/workspace/MLSandbox/polima/bin:$PATH
+  polima compile --build-dir <dir>
+'
+```
+
+Note the image alone is not enough: a bare `docker run` of the same image fails
+with `libLLVM.so.18.1: cannot open shared object file`, because the provisioned
+container has libraries the image does not. Compiling belongs in the container
+you already have, not a fresh one.
+
 To re-run it:
 
 ```bash
