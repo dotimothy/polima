@@ -122,9 +122,25 @@ def from_deployed_tree(models_dir: str | Path, graph: str) -> ElfCandidate:
     identical on the live unit.
     """
     models_dir = Path(models_dir)
-    elf = models_dir / graph / "share" / elf_filename(graph)
+    share = models_dir / graph / "share"
+    elf = share / elf_filename(graph)
     if not elf.is_file():
-        raise FileNotFoundError(f"no ELF at {elf}")
+        # The directory is the selector here, not the filename. SmolVLA's
+        # LLiMa-compiled graphs are named for the ONNX they came from --
+        # `7b375e1b..._vision_with_output_stage1_mla.elf` -- so requiring
+        # `<graph>_stage1_mla.elf` would reject a tree that is unambiguous.
+        # Only accept when there is exactly one: several means the directory
+        # holds more than one graph and picking would be a guess.
+        candidates = sorted(share.glob("*.elf")) if share.is_dir() else []
+        if len(candidates) == 1:
+            elf = candidates[0]
+        elif len(candidates) > 1:
+            raise FileNotFoundError(
+                f"{share} holds {len(candidates)} ELFs "
+                f"({', '.join(c.name for c in candidates)}); cannot choose"
+            )
+        else:
+            raise FileNotFoundError(f"no ELF at {elf}")
     return ElfCandidate(
         graph=graph,
         path=elf,

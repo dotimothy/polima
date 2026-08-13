@@ -151,3 +151,74 @@ def test_detect_rejects_unrecognised_tree(tmp_path):
 def test_detect_missing_directory(tmp_path):
     with pytest.raises(FileNotFoundError):
         detect(tmp_path / "absent")
+
+
+# --------------------------------------------- adopting hand-built trees
+
+
+def _deployed(root, directory, elf_name):
+    share = root / "models_uncompressed" / directory / "share"
+    share.mkdir(parents=True)
+    (share / elf_name).write_bytes(b"\x7fELF" * 16)
+    return share / elf_name
+
+
+def test_a_graph_is_found_under_its_legacy_directory_name(tmp_path):
+    """PoLiMa names graphs for what they are (`vision`); the SmolVLA scripts
+    encode precision and compiler in the directory (`vision_llima_bf16`)."""
+    from polima.bundle.retained import from_deployed_tree
+
+    _deployed(tmp_path, "vision_llima_bf16", "vision_llima_bf16_stage1_mla.elf")
+    found = from_deployed_tree(tmp_path / "models_uncompressed", "vision_llima_bf16")
+    assert found.path.name.endswith(".elf")
+
+
+def test_a_uniquely_named_elf_is_accepted(tmp_path):
+    """LLiMa names the ELF for the ONNX it came from, so requiring
+    `<graph>_stage1_mla.elf` would reject an unambiguous tree."""
+    from polima.bundle.retained import from_deployed_tree
+
+    _deployed(tmp_path, "vision_llima_bf16",
+              "7b375e1b73b11138ff12fe22c8f2822d8fe03467_vision_with_output_stage1_mla.elf")
+    found = from_deployed_tree(tmp_path / "models_uncompressed", "vision_llima_bf16")
+    assert found.path.name.startswith("7b375e1b")
+
+
+def test_two_elfs_in_one_share_is_refused(tmp_path):
+    """Several means the directory holds more than one graph; picking is a guess."""
+    import pytest
+
+    from polima.bundle.retained import from_deployed_tree
+
+    share = tmp_path / "models_uncompressed" / "g" / "share"
+    share.mkdir(parents=True)
+    for name in ("a_stage1_mla.elf", "b_stage1_mla.elf"):
+        (share / name).write_bytes(b"\x7fELF")
+    with pytest.raises(FileNotFoundError, match="cannot choose"):
+        from_deployed_tree(tmp_path / "models_uncompressed", "g")
+
+
+def test_a_tree_with_models_but_no_manifest_is_importable(tmp_path):
+    """compile_deploy_smolvla_som.sh writes no manifest at all."""
+    from polima.bundle.import_legacy import detect
+
+    _deployed(tmp_path, "vision_llima_bf16", "vision_llima_bf16_stage1_mla.elf")
+    assert detect(tmp_path).format == "unlabelled"
+
+
+def test_a_tree_with_neither_is_still_rejected(tmp_path):
+    import pytest
+
+    from polima.bundle.import_legacy import detect
+
+    (tmp_path / "notes.txt").write_text("nothing here")
+    with pytest.raises(ValueError, match="no recognisable manifest"):
+        detect(tmp_path)
+
+
+def test_smolvla_declares_its_legacy_names():
+    from polima.policies.registry import get_policy
+
+    aliases = {g.name: g.legacy_names for g in get_policy("smolvla").compile.graphs}
+    assert "vision_llima_bf16" in aliases["vision"]
+    assert "denoise_single_bf16" in aliases["denoise"]

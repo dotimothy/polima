@@ -81,10 +81,19 @@ def detect(build_dir: str | Path) -> LegacyBuild:
     if not fmt and "iterations" in manifest:
         fmt = "smolvla-controller"
     if not fmt:
-        raise ValueError(
-            f"{root} has no recognisable manifest "
-            "(expected input_contract.json or artifact_manifest.json)"
-        )
+        # A tree built by the shell scripts rather than a controller has no
+        # manifest at all -- SmolVLA's compile_deploy_smolvla_som.sh writes
+        # none. If the compiled models are there, that is enough to import; the
+        # things a manifest would have supplied (dataset, steps) come from
+        # --dataset / --steps, and their absence is reported rather than guessed.
+        if _has_models(root):
+            fmt = "unlabelled"
+        else:
+            raise ValueError(
+                f"{root} has no recognisable manifest "
+                "(expected input_contract.json or artifact_manifest.json) "
+                "and no models_uncompressed/, models/ or retained/ to import"
+            )
 
     return LegacyBuild(
         root=root,
@@ -94,6 +103,15 @@ def detect(build_dir: str | Path) -> LegacyBuild:
         graphs=tuple(_declared_graphs(contract)),
         verification=report,
     )
+
+
+def _has_models(root: Path) -> bool:
+    """Whether the tree holds compiled models under any known layout."""
+    for tree in (*DEPLOYED_TREES, "retained"):
+        directory = root / tree
+        if directory.is_dir() and any(directory.iterdir()):
+            return True
+    return any(root.glob("**/*_mpk.tar.gz"))
 
 
 def _declared_graphs(contract: dict) -> list[str]:
@@ -134,12 +152,24 @@ def resolve_elfs(build: LegacyBuild, spec: PolicySpec) -> dict[str, ElfCandidate
         )
 
     resolved: dict[str, ElfCandidate] = {}
-    for graph in spec.compile.names:
+    for spec_graph in spec.compile.graphs:
+        graph = spec_graph.name
         candidate = _resolve_one(build.root, graph)
+        # Hand-built trees name directories for the build, not the graph --
+        # `vision_llima_bf16` rather than `vision`. Aliases are tried in order
+        # and only after the canonical name, so a tree using both is unambiguous.
+        for alias in getattr(spec_graph, "legacy_names", ()):
+            if candidate is not None:
+                break
+            candidate = _resolve_one(build.root, alias)
+            if candidate is not None:
+                log.info("  %-24s matched legacy name %r", graph, alias)
         if candidate is None:
             raise FileNotFoundError(
                 f"no ELF for graph {graph!r} under {build.root}; looked in "
                 f"{', '.join(DEPLOYED_TREES)}, retained/, and *_mpk.tar.gz"
+                + (f" (also tried {list(spec_graph.legacy_names)})"
+                   if spec_graph.legacy_names else "")
             )
         resolved[graph] = candidate
         log.info("  %-24s %s (%s)", graph, candidate.sha256[:12], candidate.variant)

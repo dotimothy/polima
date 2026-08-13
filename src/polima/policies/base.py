@@ -210,6 +210,12 @@ class GraphSpec:
     calibration: CalibrationSource = field(default_factory=CalibrationSource)
     mla_tessellation: bool = True
     elf_from: Literal["retained", "mpk"] = "retained"
+    #: Directory names this graph is known by in hand-built trees. PoLiMa names
+    #: graphs for what they are (`vision`); the legacy SmolVLA scripts encode the
+    #: precision and compiler in the directory (`vision_llima_bf16`). Listing the
+    #: aliases is what lets --import-legacy adopt an existing build instead of
+    #: demanding it be recompiled under new names.
+    legacy_names: tuple[str, ...] = ()
     llima_args: tuple[str, ...] = ()
 
     @property

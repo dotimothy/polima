@@ -116,6 +116,7 @@ SMOLVLA_SPEC = PolicySpec(
             # Run twice per inference, once per camera.
             GraphSpec(
                 name="vision",
+                legacy_names=("vision_llima_bf16", "vision_bf16"),
                 builder="polima.policies.smolvla.graphs:VisionTower",
                 inputs=(TensorSpec("image", (1, 3, IMAGE_HEIGHT, IMAGE_WIDTH)),),
                 outputs=(TensorSpec("image_tokens", (1, 64, 960)),),
@@ -129,6 +130,7 @@ SMOLVLA_SPEC = PolicySpec(
             # cache every denoise step reads. Runs once.
             GraphSpec(
                 name="prefix",
+                legacy_names=("prefix_llima_bf16", "prefix_llima_nhwc_bf16"),
                 builder="polima.policies.smolvla.graphs:PrefixCache",
                 inputs=(TensorSpec("prefix_embeddings", (1, 241, 960)),),
                 outputs=(TensorSpec("cache", (CACHE_ELEMENTS,)),),
@@ -139,6 +141,7 @@ SMOLVLA_SPEC = PolicySpec(
             # Action expert input projection + time conditioning. Runs 10x.
             GraphSpec(
                 name="suffix",
+                legacy_names=("suffix_llima_bf16", "suffix_host_time_llima_bf16"),
                 builder="polima.policies.smolvla.graphs:SuffixProjection",
                 inputs=(TensorSpec("suffix_input", (1, 50, 752)),),
                 outputs=(TensorSpec("suffix_output", (1, 50, 720)),),
@@ -151,6 +154,7 @@ SMOLVLA_SPEC = PolicySpec(
             # most expensive thing in the pipeline.
             GraphSpec(
                 name="denoise",
+                legacy_names=("denoise_single_bf16", "denoise_core_llima_nhwc_bf16"),
                 builder="polima.policies.smolvla.graphs:DenoiseExpert",
                 inputs=(TensorSpec("denoise_input", (DENOISE_IN_ELEMENTS,)),),
                 outputs=(TensorSpec("velocity", (1, 50, 32)),),
