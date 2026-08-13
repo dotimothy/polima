@@ -250,10 +250,20 @@ class Driver:
         previous = self._state().get(name, {})
         if not self.force and previous.get("key") == key and previous.get("elf"):
             elf = self._resolve_elf(previous["elf"])
+            # A state file written before paths were stored relative holds an
+            # absolute path from whichever side compiled it. Rather than
+            # recompile nine minutes of identical work, fall back to where the
+            # convention says the ELF is -- and re-record it relative, so the
+            # tree heals itself the first time it is used from the other mount.
+            if (elf is None or not elf.exists()) and self.elf_path(graph).exists():
+                elf = self.elf_path(graph)
             if elf is not None and elf.exists():
                 self.publish(graph, elf)
-                return GraphResult(name, "reused", precision=previous.get("precision"),
-                                   elf=str(elf), key=key, note="unchanged")
+                outcome = GraphResult(name, "reused", precision=previous.get("precision"),
+                                      elf=str(elf), key=key, note="unchanged")
+                if previous.get("elf") != self._relative_elf(str(elf)):
+                    self._record(outcome)
+                return outcome
 
         attempts: list[dict] = []
         for precision in graph.precisions:

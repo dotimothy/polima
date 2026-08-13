@@ -595,3 +595,23 @@ def test_an_elf_outside_the_tree_stays_absolute(tmp_path):
     outside = tmp_path / "elsewhere.elf"
     outside.write_bytes(b"\x7fELF")
     assert driver._relative_elf(str(outside)) == str(outside)
+
+
+def test_a_stale_absolute_path_heals_instead_of_recompiling(tmp_path):
+    """State written before paths were relative holds an absolute path from the
+    other mount. Falling back to the conventional location avoids repeating ~9
+    minutes of identical work, and re-records it relative."""
+    driver = _driver(tmp_path)
+    graph = get_policy("act").compile.graph("encoder_layer_01")
+    _write_inputs(driver, graph)
+    elf = driver.elf_path(graph)
+    elf.parent.mkdir(parents=True, exist_ok=True)
+    elf.write_bytes(b"\x7fELF")
+
+    driver._record(GraphResult(graph.name, "compiled", precision="bf16",
+                               elf="/workspace/gone/encoder_layer_01_stage1_mla.elf",
+                               key=driver.stage_key(graph)))
+    assert driver.compile_graph(graph).status == "reused"
+
+    healed = json.loads((tmp_path / "compile_state.json").read_text())
+    assert healed[graph.name]["elf"] == f"retained/{graph.name}/{graph.elf_name}"
