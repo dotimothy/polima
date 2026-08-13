@@ -546,3 +546,52 @@ def test_stage_symlinks_dispatch_on_their_name():
 def test_every_stage_has_a_launcher():
     for stage in ("compile", "deploy", "run", "robot", "doctor"):
         assert _launcher(f"polima-{stage}").exists(), stage
+
+
+# ------------------------------------------------- resume across mount points
+
+
+def test_recorded_elf_is_relative_to_the_build_tree(tmp_path):
+    """The same tree is routinely seen at two paths -- the Palette container
+    mounts it as /workspace/... while the host sees ~/SDK/NEAT/workspace/... --
+    so an absolute path recorded on one side does not exist on the other and
+    every stage recompiles despite matching keys."""
+    driver = _driver(tmp_path)
+    graph = get_policy("act").compile.graph("encoder_layer_01")
+    elf = driver.elf_path(graph)
+    elf.parent.mkdir(parents=True, exist_ok=True)
+    elf.write_bytes(b"\x7fELF")
+
+    driver._record(GraphResult(graph.name, "compiled", precision="bf16",
+                               elf=str(elf), key="k"))
+    recorded = json.loads((tmp_path / "compile_state.json").read_text())
+    assert recorded[graph.name]["elf"] == f"retained/{graph.name}/{graph.elf_name}"
+
+
+def test_a_tree_compiled_elsewhere_still_reuses(tmp_path):
+    """Record as if the compile happened at a container path, then reuse from
+    the host path -- which is exactly the round trip that failed."""
+    import shutil as _shutil
+
+    container = tmp_path / "workspace" / "build"
+    graph = get_policy("act").compile.graph("encoder_layer_01")
+    driver = _driver(container)
+    _write_inputs(driver, graph)
+    elf = driver.elf_path(graph)
+    elf.parent.mkdir(parents=True, exist_ok=True)
+    elf.write_bytes(b"\x7fELF")
+    driver._record(GraphResult(graph.name, "compiled", precision="bf16",
+                               elf=str(elf), key=driver.stage_key(graph)))
+
+    host = tmp_path / "home" / "build"
+    host.parent.mkdir(parents=True, exist_ok=True)
+    _shutil.copytree(container, host)
+
+    assert _driver(host).compile_graph(graph).status == "reused"
+
+
+def test_an_elf_outside_the_tree_stays_absolute(tmp_path):
+    driver = _driver(tmp_path / "build")
+    outside = tmp_path / "elsewhere.elf"
+    outside.write_bytes(b"\x7fELF")
+    assert driver._relative_elf(str(outside)) == str(outside)

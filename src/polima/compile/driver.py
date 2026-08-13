@@ -148,11 +148,35 @@ class Driver:
         except json.JSONDecodeError:
             return {}
 
+    def _relative_elf(self, elf: str | None) -> str | None:
+        """Record the ELF relative to the build tree.
+
+        An absolute path here would undo the care taken in `stage_key`, which
+        deliberately excludes paths so a relocated tree still counts as
+        unchanged. The same build tree is routinely seen at two paths -- the
+        Palette container mounts it as /workspace/... while the host sees
+        ~/SDK/NEAT/workspace/... -- and an absolute path recorded on one side
+        simply does not exist on the other, so every stage recompiles despite
+        matching keys.
+        """
+        if not elf:
+            return elf
+        try:
+            return str(Path(elf).resolve().relative_to(self.build_dir.resolve()))
+        except ValueError:
+            return elf      # outside the tree: keep it absolute, it is all we have
+
+    def _resolve_elf(self, elf: str | None) -> Path | None:
+        if not elf:
+            return None
+        path = Path(elf)
+        return path if path.is_absolute() else self.build_dir / path
+
     def _record(self, result: GraphResult) -> None:
         state = self._state()
         state[result.name] = {
             "key": result.key,
-            "elf": result.elf,
+            "elf": self._relative_elf(result.elf),
             "precision": result.precision,
             "status": result.status,
             "recorded_at": time.time(),
@@ -225,8 +249,8 @@ class Driver:
 
         previous = self._state().get(name, {})
         if not self.force and previous.get("key") == key and previous.get("elf"):
-            elf = Path(previous["elf"])
-            if elf.exists():
+            elf = self._resolve_elf(previous["elf"])
+            if elf is not None and elf.exists():
                 self.publish(graph, elf)
                 return GraphResult(name, "reused", precision=previous.get("precision"),
                                    elf=str(elf), key=key, note="unchanged")
