@@ -10,10 +10,15 @@
 #   export PATH=/workspace/MLSandbox/polima/bin:$PATH
 #   polima compile --build-dir ...
 #
-# Interpreter choice, in order: $POLIMA_PYTHON, the model compiler's python
-# (present wherever compiling happens, and it has numpy), then python3. The
-# umbrella CLI needs stdlib + numpy only; heavier stages re-enter the
-# interpreter that owns them as a subprocess.
+# Interpreter choice: $POLIMA_PYTHON, then whatever `python3` resolves to --
+# which after `conda activate act` is that env, and in the SDK container is the
+# container's. Only if that lacks numpy does it fall back to the model
+# compiler's python.
+#
+# The order matters and the obvious one is wrong. Preferring the compiler's
+# python looks safe (it always has numpy) but it has no torch, so
+# `compile --checkpoint` dies in the export stage with ModuleNotFoundError:
+# lerobot -- ignoring the environment the caller deliberately activated.
 set -euo pipefail
 
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -22,6 +27,7 @@ export PYTHONPATH="$root/src${PYTHONPATH:+:$PYTHONPATH}"
 pick_python() {
     if [[ -n "${POLIMA_PYTHON:-}" ]]; then echo "$POLIMA_PYTHON"; return; fi
     local candidates=(
+        "$(command -v python3 || true)"
         "${MODEL_COMPILER_BIN:-}/python"
         /sdk-extensions/model-compiler/bin/python
         "$HOME/sima-sdk-extensions/model-compiler/bin/python"
