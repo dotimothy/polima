@@ -79,12 +79,15 @@ def test_vision_is_the_only_nchw_graph():
     assert [g.name for g in spec.compile.graphs if g.layout == "NCHW"] == ["vision"]
 
 
-def test_vision_goes_through_llima():
-    """It is a VLM backbone, which is what sima_lmm.host.compile_lmm exists for."""
-    spec = get_policy("smolvla")
-    vision = spec.compile.graph("vision")
-    assert vision.compiler == "llima"
-    assert not vision.mla_tessellation      # llima graphs take no tessellation
+def test_vision_is_compiled_by_afe_like_the_rest():
+    """LLiMa produces the vision ONNX; it does not compile it.
+    compile_deploy_smolvla_som.sh runs the same afe wrapper over this graph as
+    over the others, only with NCHW -- the `_llima_` in the legacy directory
+    name is about the ONNX's origin, and it misled this spec once."""
+    vision = get_policy("smolvla").compile.graph("vision")
+    assert vision.compiler == "afe"
+    assert vision.mla_tessellation
+    assert vision.layout == "NCHW"
 
 
 def test_language_conditioned_datasets_may_hold_several_tasks():

@@ -110,9 +110,18 @@ SMOLVLA_SPEC = PolicySpec(
         verify_atol=1e-3,
         verify_rtol=1e-2,
         graphs=(
-            # The SmolVLM2 vision tower. The only NCHW graph, and the only one
-            # compiled through LLiMa rather than straight afe -- it is a VLM
-            # backbone, which is exactly what sima_lmm.host.compile_lmm is for.
+            # The SmolVLM2 vision tower, and the only NCHW graph.
+            #
+            # LLiMa produces its ONNX (llima_compile_smolvlm2.py) -- it does NOT
+            # compile it. compile_deploy_smolvla_som.sh runs the same afe wrapper
+            # over this graph as over the others, just with NCHW:
+            #
+            #     compile_model "$VISION_ONNX" ... --model-layout NCHW --mla-tessellation
+            #
+            # The `_llima_` in the legacy directory name refers to where the ONNX
+            # came from, which is what misled this spec into declaring
+            # compiler="llima" and disabling tessellation.
+            #
             # Run twice per inference, once per camera.
             GraphSpec(
                 name="vision",
@@ -123,8 +132,6 @@ SMOLVLA_SPEC = PolicySpec(
                 layout="NCHW",
                 precision="bf16",
                 calibration=CalibrationSource("random"),
-                compiler="llima",
-                mla_tessellation=False,
             ),
             # Prefix: 241 tokens of vision + language + state -> the packed KV
             # cache every denoise step reads. Runs once.
