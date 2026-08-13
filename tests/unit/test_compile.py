@@ -615,3 +615,52 @@ def test_a_stale_absolute_path_heals_instead_of_recompiling(tmp_path):
 
     healed = json.loads((tmp_path / "compile_state.json").read_text())
     assert healed[graph.name]["elf"] == f"retained/{graph.name}/{graph.elf_name}"
+
+
+# ------------------------------------------------------------- parallel jobs
+
+
+def test_jobs_defaults_to_sequential(tmp_path):
+    """Memory is the limit, not CPU, and it is policy-dependent: SmolVLA's
+    compile script runs its vision and prefix stages sequentially because they
+    'each require substantial host RAM'. Parallelism is opt-in."""
+    assert _driver(tmp_path).jobs == 1
+
+
+def test_parallel_reports_in_plan_order(tmp_path):
+    """Completion order varies run to run; the report must not."""
+    driver = _driver(tmp_path, jobs=4, dry_run=True)
+    graphs = get_policy("act").compile.graphs
+    for graph in graphs:
+        _write_inputs(driver, graph)
+    results = driver.run()
+    assert [r.name for r in results] == [g.name for g in graphs]
+
+
+def test_state_writes_are_serialized(tmp_path):
+    """Several graphs finish into one compile_state.json; a lost update means a
+    stage recompiles next run for no reason."""
+    import threading
+
+    driver = _driver(tmp_path, jobs=8)
+    graphs = list(get_policy("act").compile.graphs)
+
+    def record(graph):
+        driver._record(GraphResult(graph.name, "compiled", precision="bf16",
+                                   elf=str(driver.elf_path(graph)), key="k"))
+
+    threads = [threading.Thread(target=record, args=(g,)) for g in graphs]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    state = json.loads((tmp_path / "compile_state.json").read_text())
+    assert sorted(state) == sorted(g.name for g in graphs)
+
+
+def test_one_graph_never_takes_the_parallel_path(tmp_path):
+    driver = _driver(tmp_path, jobs=8, dry_run=True)
+    graph = get_policy("act").compile.graph("encoder_layer_01")
+    _write_inputs(driver, graph)
+    assert len(driver.run(only=["encoder_layer_01"])) == 1

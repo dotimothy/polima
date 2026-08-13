@@ -107,6 +107,27 @@ for g in vision_backbone encoder_layer_00_stem encoder_layer_01 \
 done
 ```
 
+## Parallelism
+
+afe is single-threaded per graph -- measured at ~100% of one core and ~1.4-1.8 GB
+RSS for ACT -- so a sequential six-graph compile uses one core of a 20-core host
+and takes the sum of its parts. The graphs are independent: each reads its own
+ONNX and writes its own retained directory.
+
+    polima compile --build-dir <dir> -j 6
+
+    sequential   9m 30s
+    -j 6         2m 29s      (user 9m 56s against real 2m 29s)
+
+3.8x, and the floor is the slowest single graph (`vision_backbone`, 142 s). The
+ELFs are byte-identical to the sequential build.
+
+Default is 1, because the limit is memory rather than CPU and it is
+policy-dependent: SmolVLA's compile script notes its vision and prefix stages
+"each require substantial host RAM" and runs them sequentially for that reason.
+ACT at ~1.6 GB a graph parallelizes freely; check the graph sizes before raising
+it for a bigger policy.
+
 ## What the three copies disagreed on
 
 Everything was kept; nothing was chosen over anything else except one default.

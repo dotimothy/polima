@@ -62,6 +62,9 @@ def run(argv: list[str], parent: argparse.Namespace | None = None) -> int:
                         help="compile only this graph (repeatable)")
     parser.add_argument("--force", action="store_true",
                         help="recompile even when the content key is unchanged")
+    parser.add_argument("-j", "--jobs", type=int, default=1, metavar="N",
+                        help="compile N graphs at once (afe is ~1 core and "
+                             "~1.6 GB per graph; memory is the limit, not CPU)")
     parser.add_argument("--stop-after", choices=("export", "compile", "pack"), default="pack")
     parser.add_argument("--output-root", default=None, help="where bundles are written")
     parser.add_argument("--dataset", default=None, help="override the dataset name in the id")
@@ -156,7 +159,8 @@ def _compile(args, config, output_root: Path, dry_run: bool) -> int:
         return 2
 
     driver = Driver(spec=spec, build_dir=build_dir, compiler_python=compiler_python,
-                    env=env, dry_run=dry_run, force=args.force, sdk_version=version)
+                    env=env, dry_run=dry_run, force=args.force, sdk_version=version,
+                    jobs=max(1, args.jobs))
 
     print(table.section(f"compile {spec.name} in {build_dir.name}"))
     print(f"  compiler  {compiler_python}" + (f"  (ModelSDK {version})" if version else ""))

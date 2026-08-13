@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -91,6 +92,18 @@ class Driver:
     dry_run: bool = False
     force: bool = False
     sdk_version: str = ""
+    #: Graphs compiled at once. afe is single-threaded per graph -- measured at
+    #: ~100% of one core and ~1.6 GB RSS for ACT -- so a 6-graph policy uses one
+    #: core of a 20-core host and takes the sum of its parts. Independent graphs
+    #: have no ordering constraint: each reads its own ONNX and writes its own
+    #: retained directory.
+    #:
+    #: Default 1 because memory, not CPU, is the real limit and it is
+    #: policy-dependent. SmolVLA's compile script notes its vision and prefix
+    #: stages "each require substantial host RAM" and runs them sequentially for
+    #: that reason. Opt in with --jobs once you know the graph sizes.
+    jobs: int = 1
+    _state_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     # ------------------------------------------------------------- paths
 
@@ -140,6 +153,7 @@ class Driver:
         return sha256_text("\n".join(parts))
 
     def _state(self) -> dict:
+        # Callers may hold _state_lock already; this only reads.
         path = self.build_dir / STATE_FILE
         if not path.exists():
             return {}
@@ -173,6 +187,12 @@ class Driver:
         return path if path.is_absolute() else self.build_dir / path
 
     def _record(self, result: GraphResult) -> None:
+        # Serialized: with --jobs > 1 several graphs finish into the same file,
+        # and a lost update means a stage recompiles next run for no reason.
+        with self._state_lock:
+            self._record_locked(result)
+
+    def _record_locked(self, result: GraphResult) -> None:
         state = self._state()
         state[result.name] = {
             "key": result.key,
@@ -305,15 +325,54 @@ class Driver:
 
     def run(self, only: Sequence[str] | None = None) -> list[GraphResult]:
         graphs = self.select(only)
+        results = (
+            self._run_sequential(graphs) if self.jobs <= 1 or len(graphs) == 1
+            else self._run_parallel(graphs)
+        )
+        self.write_manifest(results)
+        return results
+
+    def _run_sequential(self, graphs) -> list[GraphResult]:
         results: list[GraphResult] = []
         for graph in graphs:
             result = self.compile_graph(graph)
             print(result.summary(), flush=True)
             results.append(result)
+            # Stop on the first failure: the later graphs are usually variations
+            # of the same one, so continuing mostly buys more copies of the same
+            # error and a longer wait before you see it.
             if result.status == "failed":
                 break
-        self.write_manifest(results)
         return results
+
+    def _run_parallel(self, graphs) -> list[GraphResult]:
+        """Compile independent graphs at once.
+
+        Threads rather than processes: each compile is a subprocess, so the work
+        happens outside the interpreter and the GIL is irrelevant. Results are
+        printed as they land, so a long graph does not hide the short ones that
+        already finished.
+
+        Unlike the sequential path this does not stop early -- the others are
+        already running, and killing them would waste work that is nearly done.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        workers = min(self.jobs, len(graphs))
+        print(f"  running {workers} graph(s) at a time", flush=True)
+        by_name: dict[str, GraphResult] = {}
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(self.compile_graph, g): g for g in graphs}
+            for future in as_completed(futures):
+                graph = futures[future]
+                try:
+                    result = future.result()
+                except Exception as error:            # noqa: BLE001 - reported below
+                    result = GraphResult(graph.name, "failed", note=str(error))
+                by_name[graph.name] = result
+                print(result.summary(), flush=True)
+        # Report in plan order, not completion order, so the output is stable.
+        return [by_name[g.name] for g in graphs if g.name in by_name]
 
     def select(self, only: Sequence[str] | None) -> list:
         graphs = list(self.spec.compile.graphs)
