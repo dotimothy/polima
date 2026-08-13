@@ -15,6 +15,11 @@ ELFs byte for byte.
 
 `--stop-after compile` leaves the build tree without packing, which is what you
 want while iterating on a single graph.
+
+A compile recompiles. The per-graph content key still exists and is still
+recorded, but skipping on it is opt-in via `--reuse` -- "it said reused and I
+wanted a build" is a worse failure than spending the nine minutes, especially
+when the export step re-runs either way and makes it look like work happened.
 """
 
 from __future__ import annotations
@@ -60,8 +65,12 @@ def run(argv: list[str], parent: argparse.Namespace | None = None) -> int:
                         help="skip the onnxruntime-vs-PyTorch check after export")
     parser.add_argument("--graph", action="append", metavar="NAME",
                         help="compile only this graph (repeatable)")
+    parser.add_argument("--reuse", action="store_true",
+                        help="skip graphs whose content key is unchanged "
+                             "(off by default: a compile recompiles)")
     parser.add_argument("--force", action="store_true",
-                        help="recompile even when the content key is unchanged")
+                        help=argparse.SUPPRESS)   # now the default; kept so old
+                                                  # commands and scripts still run
     parser.add_argument("-j", "--jobs", type=int, default=1, metavar="N",
                         help="compile N graphs at once (afe is ~1 core and "
                              "~1.6 GB per graph; memory is the limit, not CPU)")
@@ -159,7 +168,7 @@ def _compile(args, config, output_root: Path, dry_run: bool) -> int:
         return 2
 
     driver = Driver(spec=spec, build_dir=build_dir, compiler_python=compiler_python,
-                    env=env, dry_run=dry_run, force=args.force, sdk_version=version,
+                    env=env, dry_run=dry_run, force=not args.reuse, sdk_version=version,
                     jobs=max(1, args.jobs))
 
     print(table.section(f"compile {spec.name} in {build_dir.name}"))
@@ -174,6 +183,9 @@ def _compile(args, config, output_root: Path, dry_run: bool) -> int:
     reused = [r for r in results if r.status == "reused"]
     failed = [r for r in results if r.status == "failed"]
     print(f"\n  {len(built)} built, {len(reused)} reused, {len(failed)} failed")
+    if reused and not built and not failed:
+        print(f"  nothing changed since the last compile in this tree "
+              f"(--reuse); drop it to rebuild")
 
     if failed:
         for result in failed:

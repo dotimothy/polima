@@ -164,7 +164,19 @@ precision and, failing that, reports which log to read.
 The same applies inside an mpk — `mpk.has_elf` exists because an archive can be
 well-formed and empty of ELFs.
 
-## Resume is content-keyed
+## Resume is content-keyed, and opt-in
+
+A compile recompiles. The key below is still computed and still recorded, but
+skipping on it needs `--reuse`.
+
+That is a deliberate reversal. Reuse is correct and was on by default, but the
+export step re-runs either way -- so a run that did nothing still printed a
+verify PASS and took thirty seconds, and "0 built, 6 reused" reads like a
+failure to do the thing you asked for. Being wrong in that direction costs a
+confusing half hour; being wrong the other way costs nine minutes of CPU.
+
+    polima compile --build-dir <dir>            recompiles
+    polima compile --build-dir <dir> --reuse    skips unchanged graphs
 
 The legacy `--resume` checked whether an output file existed, so re-exporting a
 graph and re-running kept the stale ELF. `Driver.stage_key` hashes the ONNX, the

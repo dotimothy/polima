@@ -664,3 +664,36 @@ def test_one_graph_never_takes_the_parallel_path(tmp_path):
     graph = get_policy("act").compile.graph("encoder_layer_01")
     _write_inputs(driver, graph)
     assert len(driver.run(only=["encoder_layer_01"])) == 1
+
+
+def test_a_compile_recompiles_by_default(monkeypatch, tmp_path, capsys):
+    """`--reuse` is opt-in. "It said reused and I wanted a build" is a worse
+    failure than spending the time, especially when the export step re-runs
+    either way and makes it look like work happened."""
+    from polima.cli import compile as compile_cli
+
+    seen = {}
+
+    class _Driver:
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+
+        def run(self, only=None):
+            return []
+
+        def write_manifest(self, results):
+            return None
+
+    monkeypatch.setattr("polima.compile.driver.Driver", _Driver)
+    monkeypatch.setattr("polima.compile.driver.sdk_version", lambda *a, **k: "2.1.0")
+    monkeypatch.setattr("polima.compile.toolchain.require_compiler_python",
+                        lambda *a, **k: tmp_path / "python")
+    monkeypatch.setattr("polima.compile.toolchain.compiler_env", lambda *a, **k: {})
+
+    (tmp_path / "retained").mkdir()
+    compile_cli.run(["--build-dir", str(tmp_path), "--stop-after", "compile"])
+    assert seen["force"] is True
+
+    seen.clear()
+    compile_cli.run(["--build-dir", str(tmp_path), "--stop-after", "compile", "--reuse"])
+    assert seen["force"] is False
