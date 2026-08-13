@@ -10,6 +10,7 @@ Mirrors LLiMa's shape (llima-compile / llima-deploy / llima-run) as subcommands:
     polima doctor
     polima data     validate <roots...>
     polima list
+    polima clean    <build-dir> [--level scratch|inputs|all] [--yes]
 
 Subcommand modules are imported lazily so `polima doctor` still works in an
 environment where, say, torch or afe is missing -- which is exactly the
@@ -33,6 +34,7 @@ COMMANDS = {
     "doctor": ("polima.cli.doctor", "diagnose the environment (host, compiler venv, board)"),
     "data": ("polima.cli.data", "inspect, validate and combine datasets"),
     "list": ("polima.cli.list_cmd", "list registered policies"),
+    "clean": ("polima.cli.clean", "reclaim space from build trees"),
     "compile": ("polima.cli.compile", "export, quantize and compile a policy to MLA ELFs"),
     "deploy": ("polima.cli.deploy", "push a bundle to a Modalix board and start it"),
     "run": ("polima.cli.run", "run inference against a deployed bundle"),
