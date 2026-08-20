@@ -38,6 +38,8 @@ class BundleInputs:
     #: destination-relative path -> source file
     fixtures: dict[str, Path] = field(default_factory=dict)
     constants: dict[str, Path] = field(default_factory=dict)
+    #: Board-side LeRobot launcher and policy transport, relative to robot_client/.
+    robot_files: dict[str, Path] = field(default_factory=dict)
     #: graph -> extra files to place beside the ELF (etc/*.json, lib/*.so)
     model_extras: dict[str, list[Path]] = field(default_factory=dict)
     source: str = "compile"
@@ -97,10 +99,21 @@ def build_bundle(inputs: BundleInputs, output_root: str | Path) -> Bundle:
                 elf=str(destination.relative_to(root)),
                 sha256=candidate.sha256,
                 elf_bytes=destination.stat().st_size,
-                precision=inputs.precisions.get(graph.name, graph.precision),
+                precision=inputs.precisions.get(
+                    graph.name,
+                    (
+                        f"activation={graph.activation_precision or graph.precision},"
+                        f"weight={graph.weight_precision or graph.precision}"
+                        if graph.activation_precision or graph.weight_precision
+                        else graph.precision
+                    ),
+                ),
                 input_elements=sum(t.elements for t in graph.inputs),
                 output_elements=sum(t.elements for t in graph.outputs),
                 dram_layout=graph.outputs[0].dram_layout,
+                logical_width=graph.outputs[0].logical_width,
+                logical_channels=graph.outputs[0].logical_channels,
+                external_dram_layout=graph.external_dram_layout,
             )
         )
 
@@ -108,13 +121,25 @@ def build_bundle(inputs: BundleInputs, output_root: str | Path) -> Bundle:
         _copy(source, root / "fixtures" / relative)
     for relative, source in sorted(inputs.constants.items()):
         _copy(source, root / "constants" / relative)
+    for relative, source in sorted(inputs.robot_files.items()):
+        _copy(source, root / "robot_client" / relative)
+
+    # ACT's proven board client reads this before opening the socket. Keep the
+    # canonical fixture copy and expose a root-level compatibility path so the
+    # bundled launcher remains byte-for-byte the hardware-tested one.
+    client_stats = inputs.fixtures.get("normalization_stats.npz")
+    if spec.name == "act" and client_stats:
+        _copy(client_stats, root / "normalization_stats.npz")
 
     # Sidecars are recorded relative to the bundle so the C++ side can resolve
     # them without knowing anything about the host layout.
-    sidecars = sorted(
-        str((root / "constants" / relative).relative_to(root))
-        for relative in inputs.constants
-    )
+    sidecars = sorted([
+        *(str((root / "constants" / relative).relative_to(root))
+          for relative in inputs.constants),
+        *(str((root / "robot_client" / relative).relative_to(root))
+          for relative in inputs.robot_files),
+        *(["normalization_stats.npz"] if spec.name == "act" and client_stats else []),
+    ])
 
     bundle = Bundle(
         root=root,
@@ -126,6 +151,7 @@ def build_bundle(inputs: BundleInputs, output_root: str | Path) -> Bundle:
         source=inputs.source,
         legacy_source_dir=inputs.legacy_source_dir,
         tool_versions=inputs.tool_versions,
+        smoke=spec.smoke.to_dict(),
     )
 
     write_json(bundle.plan_path, _plan_dict(plan, wire=spec))
@@ -185,23 +211,30 @@ def _plan_dict(plan: RuntimePlan, wire: PolicySpec | None = None) -> dict:
 def _check_plan_against_elfs(
     spec: PolicySpec, plan: RuntimePlan, elfs: dict[str, ElfCandidate]
 ) -> None:
-    """Every run_elf must name a graph we actually have an ELF for."""
+    """Every accelerator step must name graphs for which ELFs were supplied."""
     for index, step in enumerate(plan.steps):
-        if step.op != "run_elf":
+        if step.op not in ("run_elf", "run_elf_chain"):
             continue
-        graph = step.args.get("graph")
-        if graph not in elfs:
-            raise ValueError(
-                f"plan step {index} runs graph {graph!r} but no ELF was supplied"
-            )
-        _ = spec.compile.graph(graph)
+        graphs = (
+            (step.args.get("graph"),)
+            if step.op == "run_elf" else tuple(step.args.get("graphs", ()))
+        )
+        for graph in graphs:
+            if graph not in elfs:
+                raise ValueError(
+                    f"plan step {index} runs graph {graph!r} but no ELF was supplied"
+                )
+            _ = spec.compile.graph(graph)
 
 
 def _copy(source: Path, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
-    if destination.exists() and destination.stat().st_size == source.stat().st_size:
-        if sha256_file(destination) == sha256_file(source):
-            return
+    if (
+        destination.exists()
+        and destination.stat().st_size == source.stat().st_size
+        and sha256_file(destination) == sha256_file(source)
+    ):
+        return
     shutil.copy2(source, destination)
 
 

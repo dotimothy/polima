@@ -1,6 +1,7 @@
 #include "polima/repl.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <fstream>
@@ -112,14 +113,16 @@ void print_help() {
   std::cout <<
       "\n  models              list the board's model store\n"
       "  use <n|name>        load a model (the slow part; done once)\n"
+      "  activate <n|name>   make a model the device default\n"
       "  run                 one inference on the bundle's fixture inputs\n"
-      "  bench [n=20]        time n inferences\n"
+      "  bench [n=20] [warmup=3]\n"
+      "                      time fixture inference with warm-up discarded\n"
       "  stages              per-step timings from the last run\n"
       "  check               compare against the bundle's expected output\n"
       "  info                what is loaded: graphs, buffers, wire\n"
       "  unload              free the model, and stop the server holding the MLA\n"
       "  server [stop|start] show or control polima_server\n"
-      "  robot               arm and cameras for the loaded bundle\n"
+      "  robot [preview|run] inspect hardware, view cameras, or start robot control\n"
       "  save <file>         write the last result as float32\n"
       "  help, quit\n"
       "\n  arrows for history and cursor, tab to complete, Ctrl-C to abandon\n"
@@ -170,6 +173,57 @@ std::vector<StoreEntry> scan_store(const fs::path& store) {
   return entries;
 }
 
+std::string resolve_bundle(const fs::path& store, const std::string& selection) {
+  const auto entries = scan_store(store);
+  const StoreEntry* chosen = nullptr;
+  if (!selection.empty() &&
+      std::all_of(selection.begin(), selection.end(),
+                  [](unsigned char value) { return std::isdigit(value); })) {
+    const size_t index = std::stoul(selection);
+    if (index >= 1 && index <= entries.size()) chosen = &entries[index - 1];
+  } else {
+    for (const auto& entry : entries)
+      if (entry.name == selection) chosen = &entry;
+  }
+  if (chosen == nullptr)
+    throw std::runtime_error("no such model: " + selection);
+  if (!chosen->managed)
+    throw std::runtime_error(chosen->name +
+                             " is a legacy tree and cannot be activated by PoLiMa");
+  return chosen->name;
+}
+
+std::string activate_bundle(const fs::path& store, const std::string& selection) {
+  const std::string name = resolve_bundle(store, selection);
+  const fs::path selected = store / name;
+
+  const fs::path root = store.parent_path();
+  const fs::path current = root / "current";
+  std::error_code code;
+  const auto status = fs::symlink_status(current, code);
+  if (!code && fs::exists(status) && !fs::is_symlink(status))
+    throw std::runtime_error(current.string() +
+                             " exists and is not a symlink; refusing to replace it");
+
+  // Rename a fully-created temporary symlink over `current`: readers observe
+  // either the old complete selection or the new complete selection, never a
+  // missing or half-written link. Keep the target absolute so it remains valid
+  // if POLIMA_ROOT itself is reached through a symlink.
+  const fs::path temporary = root / (".current." + std::to_string(::getpid()));
+  fs::remove(temporary, code);
+  code.clear();
+  fs::create_symlink(fs::absolute(selected), temporary, code);
+  if (code)
+    throw std::runtime_error("cannot create activation link: " + code.message());
+  fs::rename(temporary, current, code);
+  if (code) {
+    std::error_code ignored;
+    fs::remove(temporary, ignored);
+    throw std::runtime_error("cannot activate " + name + ": " + code.message());
+  }
+  return name;
+}
+
 int repl(const fs::path& store, const std::string& preselect, bool verbose) {
   auto entries = scan_store(store);
 
@@ -200,7 +254,7 @@ int repl(const fs::path& store, const std::string& preselect, bool verbose) {
   install_interrupt_handler();
   LineEditor editor;
   const std::vector<std::string> commands = {
-      "models", "use", "unload", "server", "robot", "run", "bench", "stages",
+      "models", "use", "activate", "unload", "server", "robot", "run", "bench", "stages",
       "check", "info", "save", "help", "quit"};
   auto refresh_completions = [&]() {
     std::vector<std::string> words = commands;
@@ -326,6 +380,33 @@ int repl(const fs::path& store, const std::string& preselect, bool verbose) {
         if (load(words[1])) refresh_completions();
         continue;
       }
+      if (command == "activate") {
+        if (words.size() < 2) {
+          show_models();
+          std::cout << "  usage: activate <n|name>\n";
+          continue;
+        }
+        const std::string selected = resolve_bundle(store, words[1]);
+        const auto state = server_state(root);
+        if (state.running) {
+          std::string answer;
+          editor.read("  Stop the running policy server before activation? [y/N] ", answer);
+          if (answer.empty() || (answer[0] != 'y' && answer[0] != 'Y')) {
+            std::cout << "  nothing changed\n";
+            continue;
+          }
+          stop_server(root);
+          std::cout << "  stopped the server\n";
+        }
+        const std::string active = activate_bundle(store, selected);
+        entries = scan_store(store);
+        refresh_completions();
+        std::cout << "  current -> " << active << "\n";
+        if (!loaded.empty() && loaded != active)
+          std::cout << "  this session still has " << loaded
+                    << " loaded; `use " << active << "` to switch it\n";
+        continue;
+      }
 
       if (command == "server") {
         const auto state = server_state(root);
@@ -341,10 +422,21 @@ int repl(const fs::path& store, const std::string& preselect, bool verbose) {
           else if (plan == nullptr) {
             std::cout << "  `use <n>` first -- start serves the loaded model\n";
           } else {
-            const int started =
-                start_server(root, store / loaded, plan->wire().default_port);
+            const fs::path selected = store / loaded;
+            const int port = plan->wire().default_port;
+            // The REPL and server cannot both own the same model set on the
+            // MLA. Selection is retained by path, but the in-process Plan must
+            // be released before the server loads it.
+            {
+              Quiet quiet(!verbose);
+              plan.reset();
+            }
+            loaded.clear();
+            staging.clear();
+            last_result.clear();
+            const int started = start_server(root, selected, port);
             std::cout << (started ? "  started pid " + std::to_string(started) + " on port " +
-                                        std::to_string(plan->wire().default_port) + "\n"
+                                        std::to_string(port) + "\n"
                                   : std::string("  failed to start; see var/log/server.log\n"));
           }
         } else {
@@ -384,6 +476,58 @@ int repl(const fs::path& store, const std::string& preselect, bool verbose) {
           std::cout << "  ! " << problem << "\n";
         if (cameras.empty() && ports.empty())
           std::cout << "  nothing attached to this board\n";
+
+        const std::string action = words.size() > 1 ? words[1] : "";
+        if (action.empty() || action == "status") continue;
+        if (action != "preview" && action != "run" && action != "start") {
+          std::cout << "  usage: robot [preview|run]\n";
+          continue;
+        }
+        if (!assignment.problems.empty()) {
+          std::cout << "  cannot start: resolve the camera assignments above\n";
+          continue;
+        }
+        if (action == "preview") {
+          std::cout << "  starting camera-only preview; no server or arm is started\n";
+          const int result = run_camera_preview(store / loaded, assignment);
+          std::cout << "  camera preview exited " << result << "\n";
+          continue;
+        }
+        if (ports.size() != 1) {
+          std::cout << "  cannot start: expected exactly one follower-arm serial port\n";
+          continue;
+        }
+
+        std::string answer;
+        editor.read("  Start the policy server and robot client? The follower arm may move [y/N] ",
+                    answer);
+        if (answer.empty() || (answer[0] != 'y' && answer[0] != 'Y')) {
+          std::cout << "  nothing started\n";
+          continue;
+        }
+
+        const fs::path selected = store / loaded;
+        const int port = plan->wire().default_port;
+        {
+          Quiet quiet(!verbose);
+          plan.reset();
+        }
+        loaded.clear();
+        staging.clear();
+        last_result.clear();
+        if (server_state(root).running) stop_server(root);
+        const int server_pid = start_server(root, selected, port);
+        if (!server_pid) {
+          std::cout << "  server failed to start; see var/log/server.log\n";
+          continue;
+        }
+        std::cout << "  server pid " << server_pid << " on port " << port << "\n"
+                  << "  starting robot control; Ctrl-C stops the client and leaves "
+                     "the server running\n";
+        const int result = run_robot_client(
+            selected, description, ports.front(), assignment,
+            "127.0.0.1:" + std::to_string(port));
+        std::cout << "  robot client exited " << result << "\n";
         continue;
       }
 
@@ -457,6 +601,13 @@ int repl(const fs::path& store, const std::string& preselect, bool verbose) {
       if (command == "bench") {
         if (!ensure_inputs()) continue;
         const int count = words.size() > 1 ? std::max(1, std::stoi(words[1])) : 20;
+        const int warmup = words.size() > 2 ? std::max(0, std::stoi(words[2])) : 3;
+        for (int index = 0; index < warmup && !g_interrupted; ++index) execute();
+        if (g_interrupted) {
+          std::cout << "  interrupted during warm-up\n";
+          g_interrupted = 0;
+          continue;
+        }
         std::vector<double> samples;
         samples.reserve(count);
         for (int index = 0; index < count && !g_interrupted; ++index)
@@ -469,11 +620,18 @@ int repl(const fs::path& store, const std::string& preselect, bool verbose) {
         std::sort(samples.begin(), samples.end());
         const double mean =
             std::accumulate(samples.begin(), samples.end(), 0.0) / samples.size();
+        const auto percentile = [&samples](double fraction) {
+          const size_t rank = static_cast<size_t>(
+              std::ceil(fraction * static_cast<double>(samples.size())));
+          return samples[std::min(samples.size() - 1, std::max(size_t{1}, rank) - 1)];
+        };
         std::cout << std::fixed << std::setprecision(1)
                   << "  min " << samples.front() << " / mean " << mean
                   << " / median " << samples[samples.size() / 2]
+                  << " / p95 " << percentile(0.95)
+                  << " / p99 " << percentile(0.99)
                   << " / max " << samples.back() << " ms over " << samples.size()
-                  << " runs\n";
+                  << " runs (" << warmup << " warm-up)\n";
         continue;
       }
 
@@ -501,7 +659,13 @@ int repl(const fs::path& store, const std::string& preselect, bool verbose) {
         }
         const auto reference = read_f32(expected, last_result.size());
         const auto agreement = compare(last_result, reference);
-        const bool ok = agreement.cosine >= 0.999 && agreement.mean_abs <= 0.01;
+        // The bar travels with the bundle: a quantized VLA cannot meet ACT's
+        // 0.01, and hardcoding one threshold here would either fail every
+        // SmolVLA build or stop catching a genuinely broken ACT one.
+        const double cosine_min = plan ? plan->smoke_cosine_min() : 0.999;
+        const double mean_abs_max = plan ? plan->smoke_mean_abs_max() : 0.01;
+        const bool ok =
+            agreement.cosine >= cosine_min && agreement.mean_abs <= mean_abs_max;
         std::cout << (ok ? "  PASS  " : "  FAIL  ")
                   << std::fixed << std::setprecision(6)
                   << "cosine=" << agreement.cosine

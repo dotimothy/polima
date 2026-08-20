@@ -82,12 +82,49 @@ def test_vision_is_the_only_nchw_graph():
 def test_vision_is_compiled_by_afe_like_the_rest():
     """LLiMa produces the vision ONNX; it does not compile it.
     compile_deploy_smolvla_som.sh runs the same afe wrapper over this graph as
-    over the others, only with NCHW -- the `_llima_` in the legacy directory
-    name is about the ONNX's origin, and it misled this spec once."""
+    over the others. The `_llima_` in the legacy directory name is about the
+    ONNX's origin, and it misled this spec once."""
     vision = get_policy("smolvla").compile.graph("vision")
     assert vision.compiler == "afe"
-    assert vision.mla_tessellation
+    # Plain HWC, not tessellated: measured on Modalix 2026-08-20, the HWC16
+    # output contract scored cosine 0.978 against 0.9996 for this one, for a
+    # 2 ms saving on a 300 ms chunk.
+    assert not vision.mla_tessellation
+    assert vision.external_dram_layout == "HWC"
+    assert vision.promote_rank3_hwc
+    assert vision.precision == "bf16"
+    assert vision.activation_precision is None
+    assert vision.weight_precision is None
+    assert vision.elf_from == "retained"
+    assert vision.exit_on_stable_elf
+    assert vision.llima_args == ("--no-simplify",)
     assert vision.layout == "NCHW"
+
+
+def test_compiled_output_layouts_match_modalix_downloads():
+    """Only denoise velocity crosses DRAM in byte-planed HWC16."""
+    graphs = {graph.name: graph for graph in get_policy("smolvla").compile.graphs}
+    assert (
+        graphs["vision"].outputs[0].dram_layout,
+        graphs["vision"].outputs[0].logical_width,
+        graphs["vision"].outputs[0].logical_channels,
+    ) == ("plain", None, None)
+    assert graphs["suffix"].outputs[0].dram_layout == "plain"
+    assert graphs["prefix"].outputs[0].dram_layout == "plain"
+    assert graphs["prefix"].external_dram_layout == "HWC"
+    assert not graphs["prefix"].mla_tessellation
+    assert (
+        graphs["denoise"].outputs[0].dram_layout,
+        graphs["denoise"].outputs[0].logical_width,
+        graphs["denoise"].outputs[0].logical_channels,
+    ) == ("hwc16", 50, 32)
+
+
+def test_action_graphs_request_smolvla_shape_inference():
+    graphs = {graph.name: graph for graph in get_policy("smolvla").compile.graphs}
+    assert graphs["prefix"].llima_args == ("--infer-shapes",)
+    assert graphs["suffix"].llima_args == ("--infer-shapes",)
+    assert graphs["denoise"].llima_args == ("--infer-shapes",)
 
 
 def test_language_conditioned_datasets_may_hold_several_tasks():

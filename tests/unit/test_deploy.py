@@ -184,3 +184,156 @@ def test_camera_config_skips_absent_devices():
 
     blob = ACT_SPEC.robot.camera_config({"overhead": "/dev/x"})
     assert "overhead:" in blob and "wrist:" not in blob
+
+
+# --------------------------------------------------------------- MLA recovery
+#
+# The wedge these cover cost a live board an afternoon: a SIGKILLed server
+# leaves DMA buffers behind, CMA fragments, and every later load fails with
+# MLA_LOAD_FAILED as if the ELF were corrupt.
+
+
+class _FakeResult:
+    def __init__(self, returncode: int = 0, stdout: str = "") -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+
+
+class _FakeSession:
+    """Records commands and answers `test -x` from a set of present paths."""
+
+    def __init__(self, present: tuple[str, ...] = (), cma: tuple[int, ...] = (100, 200),
+                 fail: tuple[str, ...] = ()) -> None:
+        self.present = present
+        self.commands: list[str] = []
+        self._cma = list(cma)
+        self._fail = fail
+
+    def run(self, command: str, *, check: bool = True, echo: bool = False,
+            timeout: float | None = None) -> _FakeResult:
+        self.commands.append(command)
+        if command.startswith("test -x"):
+            return _FakeResult(0 if any(p in command for p in self.present) else 1)
+        if any(marker in command for marker in self._fail):
+            return _FakeResult(1)
+        return _FakeResult(0)
+
+    def capture(self, command: str) -> str:
+        self.commands.append(command)
+        if "CmaFree" in command:
+            return f"CmaFree: {self._cma.pop(0) if self._cma else 0} kB"
+        return ""
+
+
+def test_mla_wedge_is_recognised_only_from_accelerator_errors():
+    from polima.deploy import mla
+
+    assert mla.looks_wedged("fatal: ... errCode=1001 name=MLA_LOAD_FAILED")
+    assert mla.looks_wedged("Failed to load model through MLASHM dispatcher")
+    assert mla.looks_wedged("simaai-memory: Could not allocate buffer")
+    # A bundle that is simply wrong must NOT trigger an accelerator reset.
+    assert not mla.looks_wedged("bundle.json names a missing ELF")
+    assert not mla.looks_wedged("port 8081 is served by pid(s) [42]")
+
+
+def test_mla_reset_prefers_the_sdk_recovery_script():
+    """fix_devkit_runtime.sh re-inits the memory pool before restarting the
+    services, and it is that step -- not the service restart -- that
+    defragments CMA. Restarting the dispatcher alone is the weaker fallback."""
+    from polima.deploy import mla
+
+    session = _FakeSession(present=("/usr/bin/fix_devkit_runtime.sh",))
+    report = mla.reset(session, BoardConfig())
+
+    assert report.ok and report.method == "recovery-script"
+    assert any("fix_devkit_runtime.sh" in c for c in session.commands)
+    assert not any("systemctl restart" in c for c in session.commands)
+
+
+def test_mla_reset_falls_back_to_services_without_a_recovery_script():
+    from polima.deploy import mla
+
+    session = _FakeSession(present=("/usr/bin/init_mla_memory.sh",))
+    report = mla.reset(session, BoardConfig())
+
+    assert report.ok and report.method == "services"
+    assert any(mla.DISPATCHER_SERVICE in c for c in session.commands)
+    assert any("init_mla_memory.sh" in c for c in session.commands)
+
+
+def test_mla_reset_tries_passwordless_sudo_before_sending_a_password():
+    from polima.deploy import mla
+
+    session = _FakeSession(present=("/usr/bin/fix_devkit_runtime.sh",))
+    mla.reset(session, BoardConfig(), password="hunter2")
+    sudo = next(c for c in session.commands if "fix_devkit_runtime.sh" in c
+                and c.startswith("sudo"))
+    assert sudo.index("sudo -n") < sudo.index("sudo -S"), "must try NOPASSWD first"
+    assert "-p ''" in sudo, "the prompt must be suppressed so it cannot reach a log"
+
+
+def test_mla_reset_reports_reclaimed_cma():
+    from polima.deploy import mla
+
+    session = _FakeSession(present=("/usr/bin/fix_devkit_runtime.sh",),
+                           cma=(1_031_888, 1_748_688))
+    report = mla.reset(session, BoardConfig())
+    assert report.reclaimed_kb == 716_800
+
+
+def test_mla_reset_reports_failure_rather_than_raising():
+    """A failed reset must not mask the load error that prompted it."""
+    from polima.deploy import mla
+
+    session = _FakeSession(present=("/usr/bin/fix_devkit_runtime.sh",),
+                           fail=("fix_devkit_runtime.sh",))
+    report = mla.reset(session, BoardConfig())
+    assert report.ok is False
+
+
+def test_service_start_resets_and_retries_once_on_a_wedged_mla(monkeypatch):
+    from polima.deploy import mla, service
+
+    calls: list[int] = []
+
+    def fake_launch(session, board, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("server.log: errCode=1001 name=MLA_LOAD_FAILED")
+        return "started"
+
+    monkeypatch.setattr(service, "_launch", fake_launch)
+    monkeypatch.setattr(mla, "reset", lambda *a, **k: mla.ResetReport(True, "recovery-script"))
+
+    assert service.start(None, BoardConfig(), port=8081) == "started"
+    assert len(calls) == 2, "exactly one retry, after the reset"
+
+
+def test_service_start_does_not_reset_for_an_unrelated_failure(monkeypatch):
+    from polima.deploy import mla, service
+
+    resets: list[int] = []
+    monkeypatch.setattr(service, "_launch", _raise_missing_elf)
+    monkeypatch.setattr(mla, "reset", lambda *a, **k: resets.append(1))
+
+    with pytest.raises(RuntimeError, match="missing ELF"):
+        service.start(None, BoardConfig(), port=8081)
+    assert not resets, "a bad bundle must not trigger an accelerator reset"
+
+
+def _raise_missing_elf(session, board, **kwargs):
+    raise RuntimeError("bundle.json names a missing ELF")
+
+
+def test_service_start_reraises_the_load_error_when_the_reset_fails(monkeypatch):
+    from polima.deploy import mla, service
+
+    monkeypatch.setattr(service, "_launch", _raise_mla_wedge)
+    monkeypatch.setattr(mla, "reset", lambda *a, **k: mla.ResetReport(False, "services"))
+
+    with pytest.raises(RuntimeError, match="MLA_LOAD_FAILED"):
+        service.start(None, BoardConfig(), port=8081)
+
+
+def _raise_mla_wedge(session, board, **kwargs):
+    raise RuntimeError("errCode=1001 name=MLA_LOAD_FAILED")

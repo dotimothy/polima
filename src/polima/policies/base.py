@@ -24,12 +24,14 @@ from __future__ import annotations
 
 import importlib
 from dataclasses import dataclass, field
+from itertools import pairwise
 from math import prod
 from typing import Any, Literal, Mapping, Sequence
 
 Layout = Literal["NCHW", "NHWC"]
 Precision = Literal["int8", "bf16", "mixed"]
 DramLayout = Literal["plain", "hwc16"]
+ExternalDramLayout = Literal["compiler", "HWC", "HWC16"]
 Compiler = Literal["afe", "llima"]
 Device = Literal["modalix", "mlsoc"]
 
@@ -207,9 +209,18 @@ class GraphSpec:
     compiler: Compiler = "afe"
     precision: Precision = "bf16"
     precision_fallback: tuple[Precision, ...] = ()
+    #: Optional split quantization. ``precision`` remains the attempt/fallback
+    #: label and supplies either side that is not overridden.  Some large
+    #: transformer graphs need BF16 activations for range while quantizing the
+    #: weights to INT8 to avoid a ModelSDK BF16 code-generation failure.
+    activation_precision: Precision | None = None
+    weight_precision: Precision | None = None
     calibration: CalibrationSource = field(default_factory=CalibrationSource)
     mla_tessellation: bool = True
     elf_from: Literal["retained", "mpk"] = "retained"
+    #: ModelSDK occasionally hangs after closing a complete retained ELF for
+    #: large graphs.  Opt in to the stable-file watchdog in that case.
+    exit_on_stable_elf: bool = False
     #: Directory names this graph is known by in hand-built trees. PoLiMa names
     #: graphs for what they are (`vision`); the legacy SmolVLA scripts encode the
     #: precision and compiler in the directory (`vision_llima_bf16`). Listing the
@@ -217,6 +228,15 @@ class GraphSpec:
     #: demanding it be recompiled under new names.
     legacy_names: tuple[str, ...] = ()
     llima_args: tuple[str, ...] = ()
+    #: Force the compiler-visible MLA input and output tensors to the same DRAM
+    #: representation.  HWC is the contract used by device-resident chains:
+    #: one ELF's output buffer can then be bound directly to the next ELF's
+    #: input without a download, detessellation and upload.
+    external_dram_layout: ExternalDramLayout = "compiler"
+    #: ModelSDK 2.1's MPK path assumes four dimensions when an explicit HWC
+    #: layout is selected. GR00T's token graphs are [N,W,C], so compilation
+    #: wraps their public boundary as [N,1,W,C] with numerical no-op reshapes.
+    promote_rank3_hwc: bool = False
 
     @property
     def elf_name(self) -> str:
@@ -236,6 +256,31 @@ class GraphSpec:
             tensor.validate(where)
         if self.compiler == "llima" and self.mla_tessellation:
             raise SpecError(f"{where}: llima-compiled graphs do not take MLA tessellation")
+        if self.mla_tessellation and self.external_dram_layout != "compiler":
+            raise SpecError(
+                f"{where}: mla_tessellation and external_dram_layout are mutually exclusive"
+            )
+        if self.promote_rank3_hwc and self.external_dram_layout == "compiler":
+            raise SpecError(
+                f"{where}: promote_rank3_hwc requires an explicit external_dram_layout"
+            )
+        if (
+            self.promote_rank3_hwc
+            and self.layout != "NHWC"
+            and any(len(tensor.shape) == 3 for tensor in self.inputs)
+        ):
+            raise SpecError(
+                f"{where}: promoting a rank-3 input requires layout='NHWC'"
+            )
+        if self.promote_rank3_hwc and (
+            len(self.inputs) != 1 or len(self.outputs) != 1
+            or len(self.inputs[0].shape) not in (3, 4)
+            or len(self.outputs[0].shape) not in (3, 4)
+            or (len(self.inputs[0].shape) == 4 and len(self.outputs[0].shape) == 4)
+        ):
+            raise SpecError(
+                f"{where}: HWC promotion requires one input/output and at least one rank-3 boundary"
+            )
 
 
 @dataclass(frozen=True)
@@ -272,9 +317,11 @@ class CompilePlan:
 #: interpreter. The rest land with SmolVLA in Phase 4.
 OPCODES = (
     "run_elf",          # Runner[graph].run(in -> out)
+    "run_elf_chain",    # one upload/download around compatible device-resident ELFs
     "pack",             # scatter sub-spans into one zeroed buffer at fixed offsets
     "slice",            # contiguous copy-out
     "gather_strided",   # for i<count: copy(src + i*stride, take)
+    "pixel_unshuffle",  # fold a grid x grid x C map into (grid/f)^2 x C*f^2
     "scale",            # multiply by a scalar
     "matvec",           # y[o] = b[o] + sum_i W[o*K+i] * x[i], from .f32 sidecars
     "sincos_time",      # min/max-period sin/cos time embedding
@@ -317,16 +364,59 @@ class RuntimePlan:
             raise SpecError(f"{where}: result {self.result!r} is not a declared buffer")
         for index, step in enumerate(self.steps):
             step.validate(f"{where}.steps[{index}]", self.buffers)
-            if step.op == "run_elf":
-                graph = step.args.get("graph")
-                if compile_plan is not None and graph not in compile_plan.names:
+            if step.op in ("run_elf", "run_elf_chain"):
+                graphs = (
+                    (step.args.get("graph"),)
+                    if step.op == "run_elf"
+                    else tuple(step.args.get("graphs", ()))
+                )
+                if not graphs or any(not isinstance(graph, str) for graph in graphs):
                     raise SpecError(
-                        f"{where}.steps[{index}]: run_elf names unknown graph {graph!r}"
+                        f"{where}.steps[{index}]: {step.op} needs graph name(s)"
                     )
+                if compile_plan is not None:
+                    unknown = [graph for graph in graphs if graph not in compile_plan.names]
+                    if unknown:
+                        raise SpecError(
+                            f"{where}.steps[{index}]: {step.op} names unknown graph(s) {unknown}"
+                        )
                 for source in step.args.get("in", ()):
                     if source not in self.buffers:
                         raise SpecError(
                             f"{where}.steps[{index}]: reads undeclared buffer {source!r}"
+                        )
+                if step.op == "run_elf_chain" and len(step.args.get("in", ())) != 1:
+                    raise SpecError(
+                        f"{where}.steps[{index}]: run_elf_chain requires exactly one input buffer"
+                    )
+                if step.op == "run_elf_chain" and len(graphs) < 2:
+                    raise SpecError(
+                        f"{where}.steps[{index}]: run_elf_chain requires at least two graphs"
+                    )
+                if step.op == "run_elf_chain" and compile_plan is not None:
+                    chain = [compile_plan.graph(graph) for graph in graphs]
+                    for graph in chain:
+                        if graph.external_dram_layout != "HWC":
+                            raise SpecError(
+                                f"{where}.steps[{index}]: shared graph {graph.name!r} "
+                                "must compile with external_dram_layout='HWC'"
+                            )
+                        if len(graph.inputs) != 1 or len(graph.outputs) != 1:
+                            raise SpecError(
+                                f"{where}.steps[{index}]: shared graph {graph.name!r} "
+                                "must have one input and one output"
+                            )
+                    for left, right in pairwise(chain):
+                        if left.outputs[0].elements != right.inputs[0].elements:
+                            raise SpecError(
+                                f"{where}.steps[{index}]: shared edge {left.name}->{right.name} "
+                                "has different element counts"
+                            )
+                    shared_elements = chain[0].outputs[0].elements
+                    if any(graph.outputs[0].elements != shared_elements for graph in chain):
+                        raise SpecError(
+                            f"{where}.steps[{index}]: run_elf_chain requires one fixed "
+                            "intermediate buffer size"
                         )
 
 
@@ -419,6 +509,22 @@ class RobotSpec:
 
 
 @dataclass(frozen=True)
+class SmokeSpec:
+    """Pass/fail bar for the deployed-vs-PyTorch fixture check.
+
+    Defaults are ACT's, inherited from compile_deploy_act_som.sh. A policy
+    whose graphs are quantized lands further from the reference and says so
+    here, rather than every policy sharing one bar only ACT can meet.
+    """
+
+    cosine_min: float = 0.999
+    mean_abs_max: float = 0.01
+
+    def to_dict(self) -> dict:
+        return {"cosine_min": self.cosine_min, "mean_abs_max": self.mean_abs_max}
+
+
+@dataclass(frozen=True)
 class PolicySpec:
     name: str
     display_name: str
@@ -430,6 +536,10 @@ class PolicySpec:
     runtime_plan_builder: str
     checkpoint_validator: str | None = None
     bundle_format: str = "polima-bundle-v1"
+    #: What the deployed pipeline must match to be called good. Per-policy
+    #: because the default is ACT's, and ACT is a small all-BF16 graph whose
+    #: MLA output tracks PyTorch far more closely than a quantized VLA's does.
+    smoke: SmokeSpec = field(default_factory=SmokeSpec)
 
     def graph(self, name: str) -> GraphSpec:
         return self.compile.graph(name)
@@ -479,25 +589,31 @@ class PolicySpec:
         plan = self.build_runtime_plan()
         plan.validate(f"{where}.plan", self.compile)
 
-        # Every buffer a run_elf reads/writes must match the graph's element count.
+        # Every accelerator boundary must match the graph element counts. A
+        # shared chain exposes only its first input and final output to the host.
         for index, step in enumerate(plan.steps):
-            if step.op != "run_elf":
+            if step.op not in ("run_elf", "run_elf_chain"):
                 continue
-            graph = self.compile.graph(step.args["graph"])
-            out_elements = sum(t.elements for t in graph.outputs)
+            graph_names = (
+                (step.args["graph"],)
+                if step.op == "run_elf" else tuple(step.args["graphs"])
+            )
+            first = self.compile.graph(graph_names[0])
+            last = self.compile.graph(graph_names[-1])
+            out_elements = sum(t.elements for t in last.outputs)
             declared = plan.buffers[step.out]
             if declared != out_elements:
                 raise SpecError(
                     f"{where}.plan.steps[{index}]: buffer {step.out!r} holds {declared} "
-                    f"elements but graph {graph.name!r} outputs {out_elements}"
+                    f"elements but graph {last.name!r} outputs {out_elements}"
                 )
-            in_elements = sum(t.elements for t in graph.inputs)
+            in_elements = sum(t.elements for t in first.inputs)
             sources = step.args.get("in", ())
             supplied = sum(plan.buffers[s] for s in sources)
             if supplied != in_elements:
                 raise SpecError(
                     f"{where}.plan.steps[{index}]: inputs {list(sources)} supply {supplied} "
-                    f"elements but graph {graph.name!r} expects {in_elements}"
+                    f"elements but graph {first.name!r} expects {in_elements}"
                 )
 
     def summary(self) -> dict:

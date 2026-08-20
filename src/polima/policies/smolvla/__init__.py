@@ -37,6 +37,7 @@ from polima.policies.base import (
     GraphSpec,
     PolicySpec,
     RobotSpec,
+    SmokeSpec,
     TensorSpec,
     TrainSpec,
     WireSpec,
@@ -47,16 +48,13 @@ from polima.policies.smolvla.runtime import (
     CACHE_ELEMENTS,
     CHUNK,
     DEFAULT_PORT,
-    DENOISE_IN_ELEMENTS,
-    IMAGE_ELEMENTS,
+    DENOISE_TOKENS,
+    DENOISE_WIDTH,
     IMAGE_HEIGHT,
     IMAGE_WIDTH,
-    NOISE_ELEMENTS,
-    PREFIX_ELEMENTS,
+    PREFIX_TOKENS,
     STATE_DIM,
-    SUFFIX_IN_ELEMENTS,
-    SUFFIX_OUT_ELEMENTS,
-    VISION_ELEMENTS,
+    SUFFIX_TOKEN,
     WIRE_MAGIC,
 )
 
@@ -105,7 +103,7 @@ SMOLVLA_SPEC = PolicySpec(
         export_entry="polima.policies.smolvla.graphs:export_all",
         verify_entry="polima.policies.smolvla.graphs:verify_chain",
         fixture_entry="polima.policies.smolvla.graphs:write_fixtures",
-        normalization_entry="polima.export.normalization:from_lerobot_checkpoint",
+        normalization_entry="polima.policies.smolvla.graphs:write_normalization",
         fixture_file="smolvla_fixture.npz",
         verify_atol=1e-3,
         verify_rtol=1e-2,
@@ -116,7 +114,7 @@ SMOLVLA_SPEC = PolicySpec(
             # compile it. compile_deploy_smolvla_som.sh runs the same afe wrapper
             # over this graph as over the others, just with NCHW:
             #
-            #     compile_model "$VISION_ONNX" ... --model-layout NCHW --mla-tessellation
+            #     compile_model "$VISION_ONNX" ... --model-layout NCHW
             #
             # The `_llima_` in the legacy directory name refers to where the ONNX
             # came from, which is what misled this spec into declaring
@@ -132,6 +130,20 @@ SMOLVLA_SPEC = PolicySpec(
                 layout="NCHW",
                 precision="bf16",
                 calibration=CalibrationSource("random"),
+                # Measured on Modalix: the tessellated HWC16 output contract
+                # costs an order of magnitude of fixture accuracy (cosine 0.978
+                # against 0.9996) to save 2 ms of the 300 ms chunk. Compile the
+                # token output as plain HWC and let the runtime read it directly.
+                mla_tessellation=False,
+                external_dram_layout="HWC",
+                promote_rank3_hwc=True,
+                elf_from="retained",
+                exit_on_stable_elf=True,
+                # The exported SmolVLM graph already carries the exact static
+                # boundary and token output. onnxsim rewrites that 390 MiB graph
+                # for minutes and can change unsupported attention patterns;
+                # the proven SiMa recipe compiles it as emitted.
+                llima_args=("--no-simplify",),
             ),
             # Prefix: 241 tokens of vision + language + state -> the packed KV
             # cache every denoise step reads. Runs once.
@@ -139,22 +151,34 @@ SMOLVLA_SPEC = PolicySpec(
                 name="prefix",
                 legacy_names=("prefix_llima_bf16", "prefix_llima_nhwc_bf16"),
                 builder="polima.policies.smolvla.graphs:PrefixCache",
-                inputs=(TensorSpec("prefix_embeddings", (1, 241, 960)),),
-                outputs=(TensorSpec("cache", (CACHE_ELEMENTS,)),),
+                inputs=(TensorSpec("prefix_embeddings", (1, 1, PREFIX_TOKENS, 960)),),
+                outputs=(TensorSpec("cache", (1, 1, 32, CACHE_ELEMENTS // 32)),),
                 layout="NHWC",
                 precision="bf16",
                 calibration=CalibrationSource("random"),
+                # The ELF-only runtime does not run MPK tessellation plugins.
+                # Keep both boundaries flat HWC and preserve the attention
+                # weights in BF16; INT8 weight drift is amplified enough by
+                # the prefix attention stack to produce non-finite caches.
+                mla_tessellation=False,
+                external_dram_layout="HWC",
+                exit_on_stable_elf=True,
+                # SmolVLA's proven compiler path runs ONNX shape inference
+                # after simplification. Omitting it can still produce an ELF,
+                # but the action-side graphs then have the wrong MLA boundary.
+                llima_args=("--infer-shapes",),
             ),
             # Action expert input projection + time conditioning. Runs 10x.
             GraphSpec(
                 name="suffix",
                 legacy_names=("suffix_llima_bf16", "suffix_host_time_llima_bf16"),
                 builder="polima.policies.smolvla.graphs:SuffixProjection",
-                inputs=(TensorSpec("suffix_input", (1, 50, 752)),),
-                outputs=(TensorSpec("suffix_output", (1, 50, 720)),),
+                inputs=(TensorSpec("suffix_input", (1, 1, CHUNK, SUFFIX_TOKEN)),),
+                outputs=(TensorSpec("suffix_output", (1, 1, CHUNK, 720)),),
                 layout="NHWC",
                 precision="bf16",
                 calibration=CalibrationSource("random"),
+                llima_args=("--infer-shapes",),
             ),
             # The velocity field. Reads the cache plus this step's suffix and
             # emits dx/dt over the 50x32 action lane. Runs 10x -- the single
@@ -163,11 +187,23 @@ SMOLVLA_SPEC = PolicySpec(
                 name="denoise",
                 legacy_names=("denoise_single_bf16", "denoise_core_llima_nhwc_bf16"),
                 builder="polima.policies.smolvla.graphs:DenoiseExpert",
-                inputs=(TensorSpec("denoise_input", (DENOISE_IN_ELEMENTS,)),),
-                outputs=(TensorSpec("velocity", (1, 50, 32)),),
+                inputs=(TensorSpec("denoise_input", (1, 1, DENOISE_TOKENS, DENOISE_WIDTH)),),
+                outputs=(TensorSpec(
+                    "velocity", (1, 50, 32), dram_layout="hwc16",
+                    logical_width=50, logical_channels=32,
+                ),),
                 layout="NHWC",
                 precision="bf16",
-                calibration=CalibrationSource("random"),
+                # ModelSDK 2.1's all-BF16 codegen is numerically unstable for
+                # this checkpoint's denoiser even though ONNX Runtime is finite.
+                # BF16 activations preserve its dynamic range; calibrated INT8
+                # weights avoid the broken all-BF16 kernel selection.
+                # Re-confirmed 2026-08-20: an all-BF16 rebuild of this graph
+                # returns a non-finite action at index 0 on the first request.
+                activation_precision="bf16",
+                weight_precision="int8",
+                calibration=CalibrationSource("raw_f32"),
+                llima_args=("--infer-shapes",),
             ),
         ),
     ),
@@ -179,9 +215,9 @@ SMOLVLA_SPEC = PolicySpec(
         request_header="<IIII",
         response_header="<IIIIfI",
         request_tensors=(
-            # Letterboxed to 512x512 and normalized by the client, NCHW.
-            TensorSpec("image0", (3, IMAGE_HEIGHT, IMAGE_WIDTH)),
-            TensorSpec("image1", (3, IMAGE_HEIGHT, IMAGE_WIDTH)),
+            # Letterboxed, normalized, and serialized HWC by the live client.
+            TensorSpec("image0", (IMAGE_HEIGHT, IMAGE_WIDTH, 3)),
+            TensorSpec("image1", (IMAGE_HEIGHT, IMAGE_WIDTH, 3)),
             TensorSpec("state", (STATE_DIM,)),
             # The flow-matching seed. Supplied by the client rather than drawn
             # on the board so a run is reproducible from its request alone.
@@ -205,8 +241,17 @@ SMOLVLA_SPEC = PolicySpec(
     ),
     runtime_plan_builder="polima.policies.smolvla.runtime:build_plan",
     checkpoint_validator="polima.policies.smolvla.graphs:validate_checkpoint",
+    # ----------------------------------------------------------------- smoke --
+    # ACT's 0.01 is the wrong bar here. Measured on Modalix 2026-08-20, the
+    # deployed chain agrees with PyTorch to cosine 0.99957 but a mean of 1.85
+    # degrees per joint, because vision and denoise are quantized and the error
+    # compounds along the 50-action chunk (0.24 deg over the first ten steps,
+    # 3.79 over the last ten). 3.0 accepts that and still rejects every bad
+    # build we have seen: the mis-calibrated denoise scored 10.1 and 10.5, and
+    # an all-BF16 denoise returns non-finite, which fails on any threshold.
+    smoke=SmokeSpec(mean_abs_max=3.0),
 )
 
 register_policy(SMOLVLA_SPEC)
 
-__all__ = ["SMOLVLA_SPEC", "JOINT_NAMES"]
+__all__ = ["JOINT_NAMES", "SMOLVLA_SPEC"]

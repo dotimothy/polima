@@ -74,7 +74,11 @@ def run(argv: list[str], parent: argparse.Namespace | None = None) -> int:
     expected_path = bundle.fixtures_dir / "expected" / "normalized_actions.f32"
     if args.fixture or (not args.input_dir and expected_path.is_file()):
         if expected_path.is_file():
-            report.add(numerical_smoke(actions, expected_path, name="vs-pytorch-reference"))
+            report.add(numerical_smoke(
+                actions, expected_path, name="vs-pytorch-reference",
+                cosine_min=spec.smoke.cosine_min,
+                mean_abs_max=spec.smoke.mean_abs_max,
+            ))
 
     if args.compare:
         reference_client = PolimaSOMClient(

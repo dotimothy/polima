@@ -15,6 +15,7 @@ import time
 from dataclasses import dataclass, field
 
 from polima.config.base import BoardConfig
+from polima.deploy import mla
 from polima.deploy.ssh import BoardSession
 from polima.util.logging import get
 from polima.wire.client import wait_for_port
@@ -77,12 +78,13 @@ def listening_pids(session: BoardSession, port: int) -> list[int]:
 
 
 def stop(session: BoardSession, board: BoardConfig, *, port: int | None = None,
-         timeout: float = 10.0) -> bool:
+         timeout: float | None = None) -> bool:
     """Stop the server. Returns True if anything was stopped.
 
     Targets both the recorded pid and whatever actually holds the port, because
     those can disagree.
     """
+    timeout = board.stop_timeout_s if timeout is None else timeout
     pid_file = board.path("var/run/server.pid")
     targets: list[int] = []
 
@@ -122,12 +124,54 @@ def stop(session: BoardSession, board: BoardConfig, *, port: int | None = None,
     for pid in alive:
         session.run(f"kill -9 {pid} 2>/dev/null || true", check=False)
     session.run(f"rm -f {shlex.quote(pid_file)}", check=False)
-    log.warning("server pid(s) %s did not exit; sent SIGKILL",
-                ", ".join(str(p) for p in alive))
+    # Worth the noise: SIGKILL is how the MLA's CMA pool gets fragmented, since
+    # the dead process never releases its DMA buffers. `start` recovers from the
+    # resulting MLA_LOAD_FAILED automatically, but not fragmenting it is better.
+    log.warning("server pid(s) %s did not exit within %.0fs; sent SIGKILL "
+                "(this leaks MLA buffers -- raise board.stop_timeout_s if it recurs)",
+                ", ".join(str(p) for p in alive), timeout)
     return True
 
 
 def start(
+    session: BoardSession,
+    board: BoardConfig,
+    *,
+    port: int,
+    bundle_path: str | None = None,
+    verbose: bool = False,
+    health_timeout: float | None = None,
+    reset_mla_on_failure: bool = True,
+) -> ServiceStatus:
+    """Launch polima_server, recovering once from a wedged accelerator.
+
+    A load that fails with MLA_LOAD_FAILED is usually not about the bundle: the
+    reserved CMA pool is fragmented, typically by an earlier server that was
+    SIGKILLed before it could release its DMA buffers. Retrying the load
+    unchanged fails identically forever, so the retry is worth nothing unless
+    the accelerator is reset in between -- which is what neat-genai-studio does
+    on exactly this error. Anything else propagates untouched on the first try.
+    """
+    try:
+        return _launch(session, board, port=port, bundle_path=bundle_path,
+                       verbose=verbose, health_timeout=health_timeout)
+    except RuntimeError as error:
+        if not reset_mla_on_failure or not mla.looks_wedged(str(error)):
+            raise
+        log.warning("server start failed on a wedged MLA; resetting the accelerator")
+        report = mla.reset(session, board)
+        if not report.ok:
+            log.error("MLA reset did not succeed (%s); re-raising the load failure",
+                      report.detail)
+            raise
+        reclaimed = report.reclaimed_kb
+        log.info("MLA reset via %s%s; retrying the start", report.method,
+                 f", reclaimed {reclaimed} kB of CMA" if reclaimed else "")
+    return _launch(session, board, port=port, bundle_path=bundle_path,
+                   verbose=verbose, health_timeout=health_timeout)
+
+
+def _launch(
     session: BoardSession,
     board: BoardConfig,
     *,

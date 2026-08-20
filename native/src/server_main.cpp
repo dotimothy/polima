@@ -15,6 +15,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cerrno>
 #include <csignal>
 #include <cstdint>
 #include <iostream>
@@ -43,6 +44,27 @@ struct ResponseHeader {
 std::atomic<bool> g_running{true};
 
 void handle_signal(int) { g_running = false; }
+
+void install_stop_handlers() {
+  // sigaction with sa_flags = 0, NOT std::signal(). On glibc std::signal()
+  // installs a BSD-style handler with SA_RESTART, which transparently restarts
+  // the blocking accept() below instead of letting it fail with EINTR. The
+  // handler does set g_running, but the loop never gets back to its condition
+  // to notice, so the server ignores SIGTERM until a client happens to connect.
+  //
+  // That is why `polima deploy` reported "did not exit; sent SIGKILL" on every
+  // stop. A SIGKILLed server never releases its DMA-coherent buffers, so each
+  // one fragments the MLA's CMA pool until loads start failing with
+  // MLA_LOAD_FAILED on a board with a gigabyte free. Clearing SA_RESTART is
+  // what makes a graceful stop -- and an unfragmented pool -- possible.
+  struct sigaction action{};
+  action.sa_handler = handle_signal;
+  sigemptyset(&action.sa_mask);
+  action.sa_flags = 0;
+  ::sigaction(SIGINT, &action, nullptr);
+  ::sigaction(SIGTERM, &action, nullptr);
+  std::signal(SIGPIPE, SIG_IGN);
+}
 
 double elapsed_ms(Clock::time_point start) {
   return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
@@ -78,9 +100,7 @@ int main(int argc, char** argv) {
     for (const auto& [name, elements] : wire.request_tensors)
       input_slots.emplace_back(plan.input_buffer(name), elements);
 
-    std::signal(SIGINT, handle_signal);
-    std::signal(SIGTERM, handle_signal);
-    std::signal(SIGPIPE, SIG_IGN);
+    install_stop_handlers();
 
     const int server = polima::listen_on(port);
     std::cout << "READY port=" << port << " bundle=" << plan.bundle_id()
@@ -89,6 +109,7 @@ int main(int argc, char** argv) {
 
     while (g_running) {
       const int client = accept(server, nullptr, nullptr);
+      // EINTR here is the stop signal arriving; `continue` re-tests g_running.
       if (client < 0) continue;
 
       RequestHeader header{};

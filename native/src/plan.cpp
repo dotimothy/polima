@@ -5,6 +5,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <set>
 #include <stdexcept>
 
 namespace polima {
@@ -39,13 +40,34 @@ double elapsed_ms(Clock::time_point start) {
   return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
 }
 
+void require_finite(const std::string& stage, const std::vector<float>& values) {
+  for (size_t index = 0; index < values.size(); ++index) {
+    if (!std::isfinite(values[index]))
+      throw std::runtime_error(stage + " produced a non-finite value at index " +
+                               std::to_string(index));
+  }
+}
+
+struct GraphInfo {
+  std::string name;
+  std::filesystem::path elf;
+  size_t inputs = 0;
+  size_t outputs = 0;
+  DramLayout output_layout = DramLayout::Plain;
+  size_t logical_width = 0;
+  size_t logical_channels = 0;
+  std::string external_layout = "compiler";
+};
+
 }  // namespace
 
 Opcode parse_opcode(const std::string& name) {
   if (name == "run_elf") return Opcode::RunElf;
+  if (name == "run_elf_chain") return Opcode::RunElfChain;
   if (name == "pack") return Opcode::Pack;
   if (name == "slice") return Opcode::Slice;
   if (name == "gather_strided") return Opcode::GatherStrided;
+  if (name == "pixel_unshuffle") return Opcode::PixelUnshuffle;
   if (name == "scale") return Opcode::Scale;
   if (name == "matvec") return Opcode::MatVec;
   if (name == "sincos_time") return Opcode::SincosTime;
@@ -58,9 +80,11 @@ Opcode parse_opcode(const std::string& name) {
 const char* opcode_name(Opcode opcode) {
   switch (opcode) {
     case Opcode::RunElf: return "run_elf";
+    case Opcode::RunElfChain: return "run_elf_chain";
     case Opcode::Pack: return "pack";
     case Opcode::Slice: return "slice";
     case Opcode::GatherStrided: return "gather_strided";
+    case Opcode::PixelUnshuffle: return "pixel_unshuffle";
     case Opcode::Scale: return "scale";
     case Opcode::MatVec: return "matvec";
     case Opcode::SincosTime: return "sincos_time";
@@ -79,6 +103,11 @@ Plan::Plan(const std::filesystem::path& bundle_root, bool verbose)
 
   bundle_id_ = manifest.value("bundle_id", "");
   policy_ = manifest.value("policy", "");
+  if (manifest.contains("smoke")) {
+    const json& smoke = manifest.at("smoke");
+    smoke_cosine_min_ = smoke.value("cosine_min", smoke_cosine_min_);
+    smoke_mean_abs_max_ = smoke.value("mean_abs_max", smoke_mean_abs_max_);
+  }
   result_ = plan.at("result").get<std::string>();
 
   // Allocate every buffer once, at load time. Nothing on the request path
@@ -104,26 +133,50 @@ Plan::Plan(const std::filesystem::path& bundle_root, bool verbose)
 
   sidecars_ = Sidecars(root_ / "constants");
 
-  // One Runner per graph named in bundle.json. Sizes come from the manifest, so
-  // nothing about the policy is compiled into this binary.
+  std::set<std::string> chained_graphs;
+  std::set<std::string> regular_graphs;
+  for (const auto& entry : plan.at("steps")) {
+    const auto op = entry.at("op").get<std::string>();
+    const auto args = entry.value("args", json::object());
+    if (op == "run_elf") regular_graphs.insert(args.at("graph").get<std::string>());
+    if (op == "run_elf_chain")
+      for (const auto& graph : args.at("graphs"))
+        chained_graphs.insert(graph.get<std::string>());
+  }
+  for (const auto& name : chained_graphs)
+    if (regular_graphs.count(name))
+      throw std::runtime_error("graph '" + name +
+                               "' cannot be used both directly and in a shared chain");
+
+  // Graph metadata drives both ordinary Runners and shared chains. Chained
+  // graphs are not also loaded as ordinary Runners: GR00T has 25 of them and
+  // loading every ELF twice would waste substantial device memory.
   guard_ = acquire_mla_runtime();
+  std::map<std::string, GraphInfo> graph_infos;
   for (const auto& graph : manifest.at("graphs")) {
     const auto name = graph.at("name").get<std::string>();
     const auto elf = root_ / graph.at("elf").get<std::string>();
     if (!std::filesystem::exists(elf))
       throw std::runtime_error("bundle.json names a missing ELF: " + elf.string());
 
-    const auto layout = parse_dram_layout(graph.value("dram_layout", "plain"));
-    runners_[name] = std::make_unique<Runner>(
-        name, elf, graph.at("input_elements").get<size_t>(),
-        graph.at("output_elements").get<size_t>(), layout,
-        graph.value("logical_width", size_t{0}), graph.value("logical_channels", size_t{0}));
+    GraphInfo info{name, elf, graph.at("input_elements").get<size_t>(),
+                   graph.at("output_elements").get<size_t>(),
+                   parse_dram_layout(graph.value("dram_layout", "plain")),
+                   graph.value("logical_width", size_t{0}),
+                   graph.value("logical_channels", size_t{0}),
+                   graph.value("external_dram_layout", "compiler")};
+    graph_infos[name] = info;
+    if (!chained_graphs.count(name))
+      runners_[name] = std::make_unique<Runner>(
+          name, elf, info.inputs, info.outputs, info.output_layout,
+          info.logical_width, info.logical_channels);
     if (verbose_)
       std::cout << "loaded " << name << " (" << graph.value("elf_bytes", 0) << " bytes)"
                 << std::endl;
   }
 
   // Decode the steps once, so the request path does no JSON work.
+  size_t step_index = 0;
   for (const auto& entry : plan.at("steps")) {
     Step step;
     step.opcode = parse_opcode(entry.at("op").get<std::string>());
@@ -132,6 +185,8 @@ Plan::Plan(const std::filesystem::path& bundle_root, bool verbose)
     const json args = entry.value("args", json::object());
 
     if (args.contains("graph")) step.graph = args.at("graph").get<std::string>();
+    if (args.contains("graphs"))
+      for (const auto& name : args.at("graphs")) step.graphs.push_back(name.get<std::string>());
     if (args.contains("src")) step.source = args.at("src").get<std::string>();
     if (args.contains("in"))
       for (const auto& name : args.at("in")) step.inputs.push_back(name.get<std::string>());
@@ -149,6 +204,9 @@ Plan::Plan(const std::filesystem::path& bundle_root, bool verbose)
     step.destination_stride = args.value("dst_stride", size_t{0});
     step.destination_offset = args.value("dst_offset", size_t{0});
     step.clear = args.value("clear", false);
+    step.grid = args.value("grid", size_t{0});
+    step.channels = args.value("channels", size_t{0});
+    step.factor = args.value("factor", size_t{0});
     step.scalar = args.value("scalar", 0.0f);
     step.min_period = args.value("min_period", 0.0f);
     step.max_period = args.value("max_period", 0.0f);
@@ -163,6 +221,29 @@ Plan::Plan(const std::filesystem::path& bundle_root, bool verbose)
       throw std::runtime_error("step writes undeclared buffer '" + step.out + "'");
     if (step.opcode == Opcode::RunElf && !runners_.count(step.graph))
       throw std::runtime_error("step runs graph '" + step.graph + "' with no ELF in bundle.json");
+    if (step.opcode == Opcode::RunElfChain) {
+      if (step.graphs.size() < 2)
+        throw std::runtime_error("run_elf_chain needs at least two graphs: " + step.raw);
+      if (step.inputs.size() != 1)
+        throw std::runtime_error("run_elf_chain needs exactly one input: " + step.raw);
+      std::vector<SharedStage> stages;
+      for (const auto& name : step.graphs) {
+        auto found = graph_infos.find(name);
+        if (found == graph_infos.end())
+          throw std::runtime_error("shared chain graph '" + name + "' has no ELF");
+        if (found->second.external_layout != "HWC")
+          throw std::runtime_error("shared chain graph '" + name +
+                                   "' was not compiled with external HWC layout");
+        stages.push_back({name, found->second.elf, found->second.inputs, found->second.outputs});
+      }
+      const auto& tail = graph_infos.at(step.graphs.back());
+      step.chain = "chain_" + std::to_string(step_index);
+      chains_[step.chain] = std::make_unique<SharedRunnerChain>(
+          step.chain, stages, tail.output_layout, tail.logical_width, tail.logical_channels);
+      if (buffer_sizes_.at(step.inputs.front()) != chains_.at(step.chain)->input_elements() ||
+          buffer_sizes_.at(step.out) != chains_.at(step.chain)->output_elements())
+        throw std::runtime_error("run_elf_chain plan buffer sizes disagree with bundle metadata");
+    }
     for (const auto& name : step.inputs)
       if (!buffer_sizes_.count(name))
         throw std::runtime_error("step reads undeclared buffer '" + name + "'");
@@ -173,6 +254,7 @@ Plan::Plan(const std::filesystem::path& bundle_root, bool verbose)
         throw std::runtime_error("pack part reads undeclared buffer '" + part.source + "'");
 
     steps_.push_back(std::move(step));
+    ++step_index;
   }
 }
 
@@ -213,6 +295,11 @@ void Plan::run_step(const Step& step) {
         }
         runner.run(joined.data(), out.data());
       }
+      break;
+    }
+
+    case Opcode::RunElfChain: {
+      chains_.at(step.chain)->run(buffer(step.inputs.front()).data(), out.data());
       break;
     }
 
@@ -265,6 +352,34 @@ void Plan::run_step(const Step& step) {
           throw std::runtime_error("gather_strided overruns on step " + step.raw);
         std::copy_n(source.begin() + read_at, step.take, out.begin() + write_at);
       }
+      break;
+    }
+
+    case Opcode::PixelUnshuffle: {
+      // Eagle's channel fold, between the vision chain and the connector: a
+      // grid x grid map of C channels becomes (grid/f)^2 tokens of C*f^2,
+      // matching torch.pixel_unshuffle's (c*f^2 + dy*f + dx) channel order.
+      // The connector is the one Eagle graph the chain cannot swallow, because
+      // this reshape has to happen between post_norm and it.
+      const auto& source = read_buffer(step);
+      const size_t grid = step.grid, channels = step.channels, factor = step.factor;
+      if (!grid || !channels || !factor || grid % factor)
+        throw std::runtime_error("pixel_unshuffle needs grid divisible by factor on step " +
+                                 step.raw);
+      const size_t side = grid / factor;
+      const size_t out_channels = channels * factor * factor;
+      if (source.size() != grid * grid * channels || out.size() != side * side * out_channels)
+        throw std::runtime_error("pixel_unshuffle shape mismatch on step " + step.raw);
+      for (size_t row = 0; row < side; ++row)
+        for (size_t column = 0; column < side; ++column)
+          for (size_t dy = 0; dy < factor; ++dy)
+            for (size_t dx = 0; dx < factor; ++dx) {
+              const size_t read_at =
+                  ((row * factor + dy) * grid + (column * factor + dx)) * channels;
+              const size_t write_at = (row * side + column) * out_channels + dy * factor + dx;
+              for (size_t channel = 0; channel < channels; ++channel)
+                out[write_at + channel * factor * factor] = source[read_at + channel];
+            }
       break;
     }
 
@@ -345,11 +460,19 @@ const std::vector<float>& Plan::execute() {
   for (const auto& step : steps_) {
     const auto started = Clock::now();
     run_step(step);
+    // Accelerator corruption or an incorrect DRAM layout must become a failed
+    // request, never a motor command. ELF outputs are the useful diagnostic
+    // boundaries; the final result also covers host-side arithmetic.
+    if (step.opcode == Opcode::RunElf)
+      require_finite("graph " + step.graph, buffer(step.out));
+    if (step.opcode == Opcode::RunElfChain)
+      require_finite("graph chain " + step.chain, buffer(step.out));
     if (collect_timings_)
       timings_.push_back(std::string(opcode_name(step.opcode)) + ":" +
                          (step.graph.empty() ? step.out : step.graph) + "=" +
                          std::to_string(elapsed_ms(started)));
   }
+  require_finite("result " + result_, buffer(result_));
   return buffer(result_);
 }
 

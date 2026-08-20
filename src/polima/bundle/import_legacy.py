@@ -29,7 +29,8 @@ from polima.bundle.pack import BundleInputs, build_bundle
 from polima.bundle.retained import ElfCandidate
 from polima.bundle.unpack import find_mpk, from_mpk
 from polima.policies.base import PolicySpec
-from polima.util.jsonio import read_json_or
+from polima.util.hashing import sha256_file
+from polima.util.jsonio import read_json_or, write_json
 from polima.util.logging import get
 
 log = get("bundle.import")
@@ -237,11 +238,279 @@ def collect_fixtures(build: LegacyBuild, spec: PolicySpec) -> dict[str, Path]:
             if source.is_file():
                 fixtures[f"stages/vision_output_{index}.f32"] = source
 
-    for name in ("normalization_stats.npz", "act_fixture.npz"):
+    # Newer exporters keep the end-to-end fixture in one portable NPZ.  ACT
+    # also writes the legacy direct_inputs files, but SmolVLA intentionally did
+    # not, which used to produce a bundle that `polima run --fixture` could not
+    # consume.  Materialize the wire tensors here so both freshly compiled and
+    # older exported build trees get the same runnable bundle layout.
+    fixture_archive = build.root / spec.compile.fixture_file
+    if fixture_archive.is_file():
+        materialized = build.root / ".polima_fixtures"
+        materialized.mkdir(parents=True, exist_ok=True)
+        import numpy as np
+
+        normalization: dict[str, np.ndarray] = {}
+        stats_path = build.root / "normalization_stats.npz"
+        if spec.name == "smolvla" and stats_path.is_file():
+            with np.load(stats_path, allow_pickle=False) as stats:
+                normalization = {
+                    name: np.asarray(stats[name], dtype="<f4").copy()
+                    for name in ("state_mean", "state_std", "action_mean", "action_std")
+                }
+
+        with np.load(fixture_archive, allow_pickle=False) as archive:
+            for tensor in spec.wire.request_tensors:
+                if f"inputs/{tensor.name}.f32" in fixtures:
+                    continue
+                if tensor.name not in archive:
+                    raise ValueError(
+                        f"{fixture_archive.name} has no wire tensor {tensor.name!r}"
+                    )
+                values = np.asarray(archive[tensor.name], dtype="<f4")
+                # SmolVLA's ONNX vision graph is NCHW, while its TCP client
+                # deliberately sends prepared camera frames as HWC.  Fixtures
+                # exercise the wire contract, so mirror the client here rather
+                # than serializing the exporter tensor's storage order.
+                if (
+                    spec.name == "smolvla"
+                    and tensor.name.startswith("image")
+                    and values.ndim == 4
+                    and values.shape[0] == 1
+                    and values.shape[1] == 3
+                ):
+                    values = values[0].transpose(1, 2, 0)
+                # SmolVLA performs state normalization and action
+                # denormalization inside the server plan.  Its exporter records
+                # the already-normalized model input, so convert it back to the
+                # raw wire value before materializing a runnable fixture.
+                if spec.name == "smolvla" and tensor.name == "state":
+                    if not normalization:
+                        raise FileNotFoundError(
+                            f"{stats_path} is required to materialize raw SmolVLA state"
+                        )
+                    values = (
+                        values.reshape(-1) * normalization["state_std"]
+                        + normalization["state_mean"]
+                    )
+                values = values.reshape(-1)
+                if values.size != tensor.elements:
+                    raise ValueError(
+                        f"{fixture_archive.name}:{tensor.name} holds {values.size} "
+                        f"floats; wire contract needs {tensor.elements}"
+                    )
+                destination = materialized / f"{tensor.name}.f32"
+                values.tofile(destination)
+                fixtures[f"inputs/{tensor.name}.f32"] = destination
+
+            expected_names = (
+                ("action", "normalized_actions", "normalized_action")
+                if spec.name == "smolvla"
+                else ("normalized_actions", "normalized_action")
+            )
+            expected_key = next((name for name in expected_names if name in archive), None)
+            if expected_key and "expected/normalized_actions.f32" not in fixtures:
+                expected = np.asarray(archive[expected_key], dtype="<f4").reshape(-1)
+                if spec.name == "smolvla" and expected_key != "action":
+                    if not normalization:
+                        raise FileNotFoundError(
+                            f"{stats_path} is required to materialize raw SmolVLA actions"
+                        )
+                    expected = (
+                        expected.reshape(-1, spec.dataset.action_dim)
+                        * normalization["action_std"]
+                        + normalization["action_mean"]
+                    ).reshape(-1)
+                if expected.size != spec.wire.response_elements:
+                    raise ValueError(
+                        f"{fixture_archive.name}:{expected_key} holds {expected.size} "
+                        f"floats; wire response needs {spec.wire.response_elements}"
+                    )
+                destination = materialized / "normalized_actions.f32"
+                expected.tofile(destination)
+                fixtures["expected/normalized_actions.f32"] = destination
+
+    for name in ("normalization_stats.npz", spec.compile.fixture_file):
         source = build.root / name
         if source.is_file():
             fixtures[name] = source
     return fixtures
+
+
+def collect_sidecars(build: LegacyBuild, spec: PolicySpec) -> dict[str, Path]:
+    """Collect runtime constants from a hand-built policy tree.
+
+    ACT carries normalization as a client-side fixture, but SmolVLA's runtime
+    plan consumes eight named server-side buffers. Its legacy tree stores four
+    directly as ``*.f32`` and packs the remaining means/stds into one 24-float
+    file. Materialize the packed values under the names in ``plan.json`` so a
+    legacy import is a genuinely deployable bundle, not just four ELFs.
+    """
+    names = tuple(spec.build_runtime_plan().sidecars)
+    if not names:
+        return {}
+
+    constants_dir = build.root / "constants"
+    collected: dict[str, Path] = {}
+    for name in names:
+        for candidate in (constants_dir / name, constants_dir / f"{name}.f32"):
+            if candidate.is_file():
+                collected[name] = candidate
+                break
+
+    normalization_names = ("state_mean", "state_std", "action_mean", "action_std")
+    widths = (
+        spec.dataset.state_dim,
+        spec.dataset.state_dim,
+        spec.dataset.action_dim,
+        spec.dataset.action_dim,
+    )
+    missing_normalization = [
+        name for name in normalization_names if name in names and name not in collected
+    ]
+    packed = constants_dir / "normalization_stats.f32"
+    if missing_normalization and packed.is_file():
+        import numpy as np
+
+        values = np.fromfile(packed, dtype="<f4")
+        expected = sum(widths)
+        if values.size != expected:
+            raise ValueError(
+                f"{packed} has {values.size} float32 values; expected {expected} "
+                "(state mean/std, action mean/std)"
+            )
+        staged = build.root / ".polima_sidecars"
+        staged.mkdir(parents=True, exist_ok=True)
+        offset = 0
+        for name, width in zip(normalization_names, widths):
+            target = staged / name
+            target.write_bytes(values[offset:offset + width].tobytes())
+            collected[name] = target
+            offset += width
+
+    missing = [name for name in names if name not in collected]
+    if missing:
+        raise FileNotFoundError(
+            f"missing runtime sidecar(s) {missing} under {constants_dir}"
+        )
+    return collected
+
+
+def collect_robot_files(spec: PolicySpec) -> dict[str, Path]:
+    """The proven board-side LeRobot client for this compiled policy.
+
+    These files used to be copied only by the legacy deploy scripts, which
+    meant a PoLiMa bundle could serve inference but could not drive the arm.
+    Keeping them inside the bundle makes ``polima robot run`` independent of
+    whichever hand-built model trees happen to remain on a particular board.
+    """
+    from polima.util.paths import repo_root
+
+    stack_name = (spec.train.repo_dir_hint or "").split("/", 1)[0]
+    stack = repo_root() / stack_name
+    if spec.name == "act":
+        candidates = {
+            "start.sh": stack / "scripts/start_act_robot_client_on_som.sh",
+            "preview_robot_cameras.py": stack / "preview_robot_cameras.py",
+            "run_robot_client_with_live_view.py": stack / "run_robot_client_with_live_view.py",
+            "scripts/act_som_client.py": stack / "scripts/act_som_client.py",
+            "robot_rest_position.json": stack / "robot_rest_position.json",
+            "camera_focus_config.json": stack / ".camera_focus_config.json",
+            "calibration/so-arm101.json": (
+                stack / "calibration/robots/so_follower/so-arm101.json"
+            ),
+        }
+    elif spec.name == "smolvla":
+        candidates = {
+            "start.sh": stack / "scripts/start_smolvla_robot_client_on_som.sh",
+            "preview_robot_cameras.py": stack / "preview_robot_cameras.py",
+            "run_robot_client_with_live_view.py": stack / "run_robot_client_with_live_view.py",
+            "scripts/smolvla_som_client.py": stack / "scripts/smolvla_som_client.py",
+            "robot_rest_position.json": stack / "robot_rest_position.json",
+            "camera_focus_config.json": stack / ".camera_focus_config.json",
+            "calibration/so-arm101.json": (
+                stack / "calibration/robots/so_follower/so-arm101.json"
+            ),
+        }
+    else:
+        return {}
+
+    missing = [str(path) for path in candidates.values() if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(
+            f"{spec.name} robot client is incomplete; missing " + ", ".join(missing)
+        )
+    return candidates
+
+
+def hydrate_robot_client(bundle: Bundle, spec: PolicySpec) -> bool:
+    """Upgrade an already-packed local bundle with the board client.
+
+    Bundle ids intentionally describe model arithmetic, not operational
+    launchers. This lets a deploy made with a newer PoLiMa add the completed
+    device client without recompiling identical ELFs or changing their id.
+    Returns whether the manifest changed.
+    """
+    import shutil
+
+    files = collect_robot_files(spec)
+    recorded = set(bundle.sidecars)
+    changed = False
+    for relative, source in files.items():
+        destination = bundle.root / "robot_client" / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if not destination.is_file() or sha256_file(destination) != sha256_file(source):
+            shutil.copy2(source, destination)
+            changed = True
+        recorded.add(str(destination.relative_to(bundle.root)))
+
+    if spec.name == "act":
+        fixture = bundle.root / "fixtures/normalization_stats.npz"
+        destination = bundle.root / "normalization_stats.npz"
+        if fixture.is_file():
+            if not destination.is_file() or sha256_file(destination) != sha256_file(fixture):
+                shutil.copy2(fixture, destination)
+                changed = True
+            recorded.add("normalization_stats.npz")
+
+    sidecars = sorted(recorded)
+    if sidecars != bundle.sidecars:
+        bundle.sidecars = sidecars
+        changed = True
+    if changed:
+        write_json(bundle.manifest_path, bundle.to_dict())
+    return changed
+
+
+def hydrate_runtime_metadata(bundle: Bundle, spec: PolicySpec) -> bool:
+    """Upgrade graph layout metadata without touching content-addressed ELFs.
+
+    Early bundles did not record the compiler's physical output contract.
+    PoLiMa copies the current policy declaration into ``bundle.json`` so its
+    generic runner decodes each graph exactly as the compiled ELF emits it.
+    """
+    changed = False
+    declared = {graph.name: graph for graph in spec.compile.graphs}
+    for artifact in bundle.graphs:
+        graph = declared.get(artifact.name)
+        if graph is None:
+            continue
+        output = graph.outputs[0]
+        values = {
+            "dram_layout": output.dram_layout,
+            "logical_width": output.logical_width,
+            "logical_channels": output.logical_channels,
+            "external_dram_layout": graph.external_dram_layout,
+        }
+        for field, value in values.items():
+            if getattr(artifact, field) != value:
+                setattr(artifact, field, value)
+                changed = True
+    if bundle.smoke != spec.smoke.to_dict():
+        bundle.smoke = spec.smoke.to_dict()
+        changed = True
+    if changed:
+        write_json(bundle.manifest_path, bundle.to_dict())
+    return changed
 
 
 def import_legacy(
@@ -266,6 +535,8 @@ def import_legacy(
 
     elfs = resolve_elfs(build, spec)
     fixtures = collect_fixtures(build, spec)
+    constants = collect_sidecars(build, spec)
+    robot_files = collect_robot_files(spec)
 
     tool_versions = {"source_format": build.format}
     if build.verification:
@@ -279,6 +550,8 @@ def import_legacy(
             steps=steps if steps is not None else build.steps,
             checkpoint=build.checkpoint,
             fixtures=fixtures,
+            constants=constants,
+            robot_files=robot_files,
             source=source,
             legacy_source_dir=str(build.root),
             tool_versions=tool_versions,

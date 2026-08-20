@@ -78,9 +78,12 @@ class GraphArtifact:
     input_elements: int = 0
     output_elements: int = 0
     dram_layout: str = "plain"
+    logical_width: int | None = None
+    logical_channels: int | None = None
+    external_dram_layout: str = "compiler"
 
     def to_dict(self) -> dict:
-        return {
+        result = {
             "name": self.name,
             "elf": self.elf,
             "sha256": self.sha256,
@@ -89,7 +92,13 @@ class GraphArtifact:
             "input_elements": self.input_elements,
             "output_elements": self.output_elements,
             "dram_layout": self.dram_layout,
+            "external_dram_layout": self.external_dram_layout,
         }
+        if self.logical_width is not None:
+            result["logical_width"] = self.logical_width
+        if self.logical_channels is not None:
+            result["logical_channels"] = self.logical_channels
+        return result
 
 
 @dataclass
@@ -110,6 +119,9 @@ class Bundle:
     source: str = "compile"                    # compile | legacy-import
     legacy_source_dir: str | None = None
     tool_versions: dict = field(default_factory=dict)
+    #: The policy's smoke thresholds, copied here so the board can apply the
+    #: same bar as the host without shipping the Python policy package.
+    smoke: dict = field(default_factory=dict)
     format: str = BUNDLE_FORMAT
 
     # ---- on-disk layout; every consumer goes through these, never globs ----
@@ -175,11 +187,12 @@ class Bundle:
             "graphs": [artifact.to_dict() for artifact in self.graphs],
             "sidecars": sorted(self.sidecars),
             "tool_versions": self.tool_versions,
+            "smoke": self.smoke,
             "total_elf_bytes": self.total_elf_bytes,
         }
 
     @classmethod
-    def from_dict(cls, data: dict, root: str | Path) -> "Bundle":
+    def from_dict(cls, data: dict, root: str | Path) -> Bundle:
         return cls(
             root=Path(root),
             policy=data["policy"],
@@ -190,5 +203,6 @@ class Bundle:
             source=data.get("source", "compile"),
             legacy_source_dir=data.get("legacy_source_dir"),
             tool_versions=data.get("tool_versions", {}),
+            smoke=data.get("smoke", {}),
             format=data.get("format", BUNDLE_FORMAT),
         )

@@ -41,6 +41,11 @@ class BoardConfig:
     # Refuse to deploy unless free space is this multiple of the bundle size.
     free_space_factor: float = 1.5
     health_timeout_s: float = 30.0
+    #: SIGTERM grace before `stop` escalates to SIGKILL. Generous on purpose:
+    #: a killed server never releases its DMA-coherent buffers, so every
+    #: escalation fragments the MLA's CMA pool a little more, and a SmolVLA
+    #: bundle unloading 1.3 GB across four models does not finish in 10s.
+    stop_timeout_s: float = 30.0
     connect_timeout_s: float = 10.0
     #: Directory under `root` holding deployed model trees. `models` rather than
     #: `bundles` so PoLiMa bundles sit alongside the hand-built deploy roots

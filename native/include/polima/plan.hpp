@@ -35,9 +35,11 @@ namespace polima {
 
 enum class Opcode {
   RunElf,
+  RunElfChain,
   Pack,
   Slice,
   GatherStrided,
+  PixelUnshuffle,
   Scale,
   MatVec,
   SincosTime,
@@ -64,6 +66,8 @@ struct Step {
   Opcode opcode;
   std::string out;
   std::string graph;                 // run_elf
+  std::vector<std::string> graphs;   // run_elf_chain
+  std::string chain;                 // internal SharedRunnerChain key
   std::string source;                // args["src"] -- slice, gather_strided, scale, ...
   std::vector<std::string> inputs;   // args["in"]  -- run_elf and friends
   std::vector<PackPart> parts;       // pack
@@ -84,6 +88,9 @@ struct Step {
   std::string std_dev;
   size_t rows = 0;
   size_t cols = 0;
+  size_t grid = 0;                   // pixel_unshuffle: input side, in tokens
+  size_t channels = 0;               // pixel_unshuffle: input channels
+  size_t factor = 0;                 // pixel_unshuffle: fold factor
   std::string raw;                   // original JSON, for error messages
 };
 
@@ -116,6 +123,11 @@ class Plan {
   const WireDescription& wire() const { return wire_; }
   const std::string& bundle_id() const { return bundle_id_; }
   const std::string& policy() const { return policy_; }
+  //: The bundle's own pass/fail bar for `check`, written by the packer from
+  //: the policy spec. Absent in bundles packed before smoke thresholds were
+  //: per-policy, which keep ACT's historical 0.999 / 0.01.
+  double smoke_cosine_min() const { return smoke_cosine_min_; }
+  double smoke_mean_abs_max() const { return smoke_mean_abs_max_; }
   size_t result_elements() const { return buffer_sizes_.at(result_); }
   const std::vector<std::string>& stage_timings() const { return timings_; }
   // Timing builds a string per step, which on SmolVLA's 82-step plan is real
@@ -140,12 +152,15 @@ class Plan {
   bool collect_timings_ = false;
   std::string bundle_id_;
   std::string policy_;
+  double smoke_cosine_min_ = 0.999;
+  double smoke_mean_abs_max_ = 0.01;
   std::string result_;
   WireDescription wire_;
 
   std::map<std::string, std::vector<float>> buffers_;
   std::map<std::string, size_t> buffer_sizes_;
   std::map<std::string, std::unique_ptr<Runner>> runners_;
+  std::map<std::string, std::unique_ptr<SharedRunnerChain>> chains_;
   std::vector<Step> steps_;
   Sidecars sidecars_;
   std::vector<std::string> timings_;

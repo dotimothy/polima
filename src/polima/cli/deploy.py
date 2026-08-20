@@ -7,9 +7,11 @@ import sys
 from pathlib import Path
 
 from polima.bundle.layout import Bundle
+from polima.cli import wizard
 from polima.config.loader import load
-from polima.deploy import deploy as run_deploy
 from polima.deploy import board as board_ops
+from polima.deploy import mla
+from polima.deploy import deploy as run_deploy
 from polima.deploy.service import logs as server_logs
 from polima.deploy.service import status as service_status
 from polima.deploy.service import stop as stop_server
@@ -21,6 +23,12 @@ from polima.util.paths import outputs_root
 
 
 def run(argv: list[str], parent: argparse.Namespace | None = None) -> int:
+    if wizard.bare_invocation_is_interactive(argv):
+        composed = _session(parent)
+        if composed is None:
+            return 130
+        argv = composed
+
     parser = argparse.ArgumentParser(prog="polima-deploy")
     parser.add_argument("--bundle", help="bundle id or path")
     parser.add_argument("--board", default=None, help="user@host")
@@ -38,6 +46,8 @@ def run(argv: list[str], parent: argparse.Namespace | None = None) -> int:
     parser.add_argument("--stop", action="store_true", help="stop the server")
     parser.add_argument("--logs", type=int, nargs="?", const=40, help="tail the server log")
     parser.add_argument("--activate", metavar="BUNDLE_ID", help="switch `current` and restart")
+    parser.add_argument("--reset-mla", action="store_true",
+                        help="reset the accelerator (SDK recovery script) and exit")
 
     args = parser.parse_args(argv)
     config = load(
@@ -47,7 +57,8 @@ def run(argv: list[str], parent: argparse.Namespace | None = None) -> int:
     board = config.board
     dry_run = bool(getattr(parent, "dry_run", False))
 
-    if args.list or args.status or args.stop or args.logs is not None or args.activate:
+    if (args.list or args.status or args.stop or args.logs is not None
+            or args.activate or args.reset_mla):
         return _manage(args, board, dry_run)
 
     if not args.bundle:
@@ -55,6 +66,13 @@ def run(argv: list[str], parent: argparse.Namespace | None = None) -> int:
 
     bundle = _resolve_bundle(args.bundle, args.bundles_root)
     spec = get_policy(bundle.policy)
+    # Bundles packed before device-side robot launch was completed can be
+    # upgraded in place: the id covers model arithmetic, while bundle.json's
+    # sidecars make the deploy notice and transfer the added client files.
+    from polima.bundle.import_legacy import hydrate_robot_client, hydrate_runtime_metadata
+
+    hydrate_runtime_metadata(bundle, spec)
+    hydrate_robot_client(bundle, spec)
     port = args.port or board.port or spec.wire.default_port
 
     report = run_deploy(
@@ -83,12 +101,23 @@ def run(argv: list[str], parent: argparse.Namespace | None = None) -> int:
     return 0 if report.ok else 1
 
 
+def _session(parent: argparse.Namespace | None) -> list[str] | None:
+    """Compose deploy flags interactively, then use the normal deploy path."""
+    config = load(config_file=getattr(parent, "config", None))
+    bundle_root = (config.paths.outputs or outputs_root()) / "bundles"
+    try:
+        return wizard.compose_deploy(config.board, bundle_root)
+    except (wizard.Cancelled, KeyboardInterrupt):
+        print("\n  cancelled")
+        return None
+
+
 def _detail(stage: str, info: dict) -> str:
     if stage == "preflight":
         return f"{info.get('machine', '?')}, {info.get('cores', '?')} cores, " \
                f"{info.get('free_bytes', 0) / 1e9:.0f} GB free"
     if stage == "build":
-        return f"hash {info.get('source_hash', '?')}"
+        return info.get("reason") or f"hash {info.get('source_hash', '?')}"
     if stage == "sync-bundle":
         size = info.get("bytes")
         return f"{size / 1048576:.1f} MiB" if size else info.get("reason", "")
@@ -121,6 +150,24 @@ def _manage(args, board, dry_run: bool) -> int:
             stopped = stop_server(session, board)
             print("stopped" if stopped else "no server was running")
             return 0
+
+        if args.reset_mla:
+            # Stop first: the reset restarts the dispatcher underneath any
+            # process still holding models, and a server that survives it is
+            # left talking to a runtime that no longer knows about its ELFs.
+            stop_server(session, board)
+            report = mla.reset(session, board)
+            if args.json:
+                print(dumps(report.to_dict()), end="")
+                return 0 if report.ok else 1
+            print(f"MLA reset via {report.method}: "
+                  f"{'ok' if report.ok else 'FAILED'}")
+            for step in report.steps:
+                print(f"  {step}")
+            if report.reclaimed_kb is not None:
+                print(f"  CmaFree {report.cma_free_kb_before} -> "
+                      f"{report.cma_free_kb_after} kB ({report.reclaimed_kb:+d})")
+            return 0 if report.ok else 1
 
         if args.logs is not None:
             print(server_logs(session, board, args.logs))
