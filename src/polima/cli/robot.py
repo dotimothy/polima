@@ -27,6 +27,8 @@ the first step of running a robot was reading USB ids out of `ls /dev/v4l/by-id`
 from __future__ import annotations
 
 import argparse
+import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -57,6 +59,12 @@ def run(argv: list[str], parent: argparse.Namespace | None = None) -> int:
     parser.add_argument("--policy", default="act")
     sub = parser.add_subparsers(dest="command", required=True)
 
+    installer = sub.add_parser(
+        "install", help="provision this board: LeRobot venv, board package, binaries")
+    installer.add_argument("--script", default=None,
+                           help="override scripts/install_polima_modalix.sh")
+    installer.add_argument("--json", action="store_true")
+
     for name, help_text in (
         ("ports", "list the attached arm and cameras"),
         ("doctor", "check everything the control loop needs"),
@@ -77,6 +85,9 @@ def run(argv: list[str], parent: argparse.Namespace | None = None) -> int:
             child.add_argument("--no-live-view", action="store_true")
 
     args = parser.parse_args(argv)
+    if args.command == "install":
+        return _install(args)
+
     spec = get_policy(args.policy)
     config = load(config_file=getattr(parent, "config", None))
 
@@ -94,6 +105,58 @@ def run(argv: list[str], parent: argparse.Namespace | None = None) -> int:
               f"models/<tree>/robot_client/.", file=sys.stderr)
         return 2
     return 2
+
+
+# ------------------------------------------------------------------- install
+
+
+def _install(args) -> int:
+    """Provision this board by delegating to scripts/install_polima_modalix.sh.
+
+    Delegates rather than reimplements. That script already installs the
+    LeRobot environment (via lerobot_sima/), the board package and the two
+    native binaries; duplicating any of it here would fork logic that
+    `make check-legacy-intact` exists to keep unforked. All this adds is a
+    discoverable front door, because the path to a shell script is not
+    something the CLI should expect you to know.
+    """
+    relative = Path("scripts") / "install_polima_modalix.sh"
+    # The board runs polima from a pip install under the LeRobot venv, where
+    # __file__ is site-packages/polima/cli/robot.py and walking up finds no
+    # repository at all. So try the source checkout AND the deployed board
+    # layout, and if neither has it, say where we looked rather than guessing.
+    candidates = (
+        [Path(args.script)] if args.script else
+        [Path(p) for p in [os.environ.get("POLIMA_INSTALLER")] if p] +
+        [Path(__file__).resolve().parents[3] / relative,
+         Path(os.environ.get("POLIMA_ROOT", "/media/nvme/polima")) / "src" / relative]
+    )
+    script = next((c for c in candidates if c.is_file()), None)
+    if script is None:
+        print("polima robot install: no installer found. Looked in:", file=sys.stderr)
+        for candidate in candidates:
+            print(f"  {candidate}", file=sys.stderr)
+        print("  Pass --script, or set POLIMA_INSTALLER.", file=sys.stderr)
+        return 2
+    if not os.access(script, os.X_OK):
+        print(f"polima robot install: {script} is not executable", file=sys.stderr)
+        return 2
+    # The installer refuses to run anywhere else, but saying so here costs one
+    # line and beats a failure 300 lines into a board provision.
+    if platform.machine() != "aarch64":
+        print(f"polima robot install: this provisions a Modalix board and must run "
+              f"on it; this host is {platform.machine()}.\n"
+              f"  Deploy from the host instead: polima deploy --bundle <id> --start",
+              file=sys.stderr)
+        return 2
+
+    print(f"running {script}")
+    result = subprocess.run([str(script)], check=False)
+    if args.json:
+        from polima.util.jsonio import dumps
+
+        print(dumps({"script": str(script), "returncode": result.returncode}), end="")
+    return result.returncode
 
 
 # --------------------------------------------------------------------- ports

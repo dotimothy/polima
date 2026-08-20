@@ -6,7 +6,7 @@ Mirrors LLiMa's shape (llima-compile / llima-deploy / llima-run) as subcommands:
     polima compile  --policy act --checkpoint <path>
     polima deploy   --bundle <id> --board sima@192.168.91.211
     polima run      --bundle <id> --fixture
-    polima robot    teleop | doctor | ports | preview | install | run
+    polima robot    install | ports | doctor | preview | calibrate | run
     polima doctor
     polima data     validate <roots...>
     polima list
@@ -31,6 +31,7 @@ from polima.util.logging import setup
 #: is exactly the situation doctor exists to diagnose.
 #: Where each stage runs: see polima.role.HOST_COMMANDS / BOARD_COMMANDS.
 COMMANDS = {
+    "help": ("polima.cli.help_cmd", "show help for PoLiMa or a specific command"),
     "doctor": ("polima.cli.doctor", "diagnose the environment (host, compiler venv, board)"),
     "data": ("polima.cli.data", "inspect, validate and combine datasets"),
     "list": ("polima.cli.list_cmd", "list registered policies"),
@@ -39,6 +40,7 @@ COMMANDS = {
     "deploy": ("polima.cli.deploy", "push a bundle to a Modalix board and start it"),
     "run": ("polima.cli.run", "run inference against a deployed bundle"),
     "robot": ("polima.cli.robot", "robot control: teleop, diagnostics, live view"),
+    "studio": ("polima.cli.studio", "manage the SOM web control cockpit"),
 }
 
 _NOT_YET = {

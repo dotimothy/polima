@@ -168,3 +168,68 @@ def test_probe_survives_a_bad_interpreter():
     from polima.robot.env import probe
 
     assert probe("/nonexistent/python", "test") is None
+
+
+# ------------------------------------------------------------------- install
+
+
+def test_robot_install_is_advertised_exactly_as_implemented():
+    """The top-level help drifted once: it listed `teleop` and `install`, which
+    did not exist, and omitted `calibrate`, which did."""
+    from polima.cli import main as cli_main
+    from polima.cli import robot
+
+    advertised = [
+        word.strip()
+        for line in (cli_main.__doc__ or "").splitlines() if "polima robot" in line
+        for word in line.split("polima robot", 1)[1].split("|")
+    ]
+    parser_names = _robot_subcommands(robot)
+    assert advertised, "the help line should still list the robot subcommands"
+    assert set(advertised) == set(parser_names), (advertised, parser_names)
+
+
+def _robot_subcommands(robot_module) -> list[str]:
+    import contextlib
+    import io
+
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer), contextlib.suppress(SystemExit):
+        robot_module.run(["--help"])
+    text = buffer.getvalue()
+    inner = text.split("{", 1)[1].split("}", 1)[0]
+    return [name.strip() for name in inner.split(",")]
+
+
+def test_robot_install_refuses_to_provision_a_non_board(monkeypatch, capsys):
+    """It must fail before running anything, not 300 lines into a provision."""
+    from polima.cli import robot
+
+    monkeypatch.setattr(robot.platform, "machine", lambda: "x86_64")
+    assert robot.run(["install"]) == 2
+    assert "must run on it" in capsys.readouterr().err
+
+
+def test_robot_install_reports_every_path_it_searched(monkeypatch, capsys):
+    from polima.cli import robot
+
+    monkeypatch.setattr(robot.platform, "machine", lambda: "aarch64")
+    assert robot.run(["install", "--script", "/nonexistent/installer.sh"]) == 2
+    assert "/nonexistent/installer.sh" in capsys.readouterr().err
+
+
+def test_robot_install_looks_in_the_deployed_board_layout(monkeypatch, tmp_path):
+    """On the board polima is a pip install under the LeRobot venv, so walking
+    up from __file__ finds no repository -- $POLIMA_ROOT/src must be tried."""
+    from polima.cli import robot
+
+    installer = tmp_path / "src" / "scripts" / "install_polima_modalix.sh"
+    installer.parent.mkdir(parents=True)
+    installer.write_text("#!/bin/sh\nexit 7\n")
+    installer.chmod(0o755)
+
+    monkeypatch.setenv("POLIMA_ROOT", str(tmp_path))
+    monkeypatch.setattr(robot.platform, "machine", lambda: "aarch64")
+    monkeypatch.setattr(robot.Path, "is_file",
+                        lambda self: str(self) == str(installer))
+    assert robot.run(["install"]) == 7

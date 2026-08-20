@@ -1,0 +1,375 @@
+from __future__ import annotations
+
+import time
+from pathlib import Path
+
+import pytest
+
+from polima.studio.models import RunConfig, StudioState
+from polima.studio.runtime import (
+    Conflict,
+    StudioRuntime,
+    benchmark_failure,
+    parse_benchmark_output,
+    process_failure,
+)
+from polima.studio.store import StudioStore
+
+
+def config(root: Path) -> RunConfig:
+    bundle = root / "models/demo"
+    bundle.mkdir(parents=True)
+    devices = root / "devices"
+    devices.mkdir()
+    for name in ("arm", "overhead", "wrist"):
+        (devices / name).touch()
+    return RunConfig(
+        bundle="demo",
+        task="Pick up the block.",
+        robot_port=str(devices / "arm"),
+        overhead_camera=str(devices / "overhead"),
+        wrist_camera=str(devices / "wrist"),
+    )
+
+
+def test_run_config_validation() -> None:
+    with pytest.raises(ValueError, match="missing run configuration"):
+        RunConfig.from_json({})
+    with pytest.raises(ValueError, match="fps"):
+        RunConfig.from_json({
+            "bundle": "x", "task": "x", "robot_port": "x",
+            "overhead_camera": "x", "wrist_camera": "x", "fps": 100,
+        })
+
+
+def test_only_one_controller_holds_the_baton_at_a_time(tmp_path: Path) -> None:
+    """One controller at a time is a safety property -- two tabs driving one
+    arm is genuinely unsafe -- but it is enforced by handing the baton on,
+    not by refusing the second browser. Renewal by the holder is unchanged."""
+    runtime = StudioRuntime(tmp_path)
+    first = runtime.claim_lease()
+    renewed = runtime.claim_lease(first["token"])
+    assert renewed["token"] == first["token"]
+    runtime.require_lease(first["token"])
+
+    stolen = runtime.claim_lease()
+    assert stolen["token"] != first["token"]
+    runtime.require_lease(stolen["token"])
+    with pytest.raises(Conflict):
+        runtime.require_lease(first["token"])
+
+
+def test_same_browser_can_recover_lease_without_in_memory_token(tmp_path: Path) -> None:
+    runtime = StudioRuntime(tmp_path)
+    first = runtime.claim_lease(owner="browser-a")
+    recovered = runtime.claim_lease(owner="browser-a")
+    assert recovered["token"] == first["token"]
+    # A different browser now takes over rather than being locked out until
+    # the 30s lease lapses; the displaced token stops validating.
+    other = runtime.claim_lease(owner="browser-b")
+    assert other["token"] != first["token"]
+    with pytest.raises(Conflict):
+        runtime.require_lease(first["token"])
+
+
+def test_arming_token_is_bound_to_exact_config(tmp_path: Path) -> None:
+    runtime = StudioRuntime(tmp_path, command=tmp_path / "polima")
+    runtime.command.touch()
+    runtime.command.chmod(0o755)
+    run = config(tmp_path)
+    armed = runtime.arm(run)
+    assert runtime.state == StudioState.ARMING
+    changed = RunConfig(**{**run.to_json(), "task": "A different task"})
+    with pytest.raises(Conflict, match="does not match"):
+        runtime.start_robot(changed, armed["arming_token"])
+    assert runtime.state == StudioState.IDLE
+
+
+def test_store_records_and_prunes_runs(tmp_path: Path) -> None:
+    store = StudioStore(tmp_path / "studio.sqlite3", max_runs=2)
+    for index in range(3):
+        run_id = store.begin_run({"bundle": "demo", "task": str(index)}, f"{index}.log")
+        store.finish_run(run_id, "completed")
+    runs = store.list_runs()
+    assert [item["task"] for item in runs] == ["2", "1"]
+
+
+def test_preview_process_is_supervised(tmp_path: Path) -> None:
+    run = config(tmp_path)
+    command = tmp_path / "polima"
+    command.write_text("#!/bin/sh\necho 'Camera preview server: http://127.0.0.1:5001/token/'\n")
+    command.chmod(0o755)
+    runtime = StudioRuntime(tmp_path, command=command)
+    runtime.start_preview("demo", run.overhead_camera, run.wrist_camera)
+    deadline = time.time() + 2
+    while runtime.state == StudioState.PREVIEWING and time.time() < deadline:
+        time.sleep(0.01)
+    assert runtime.state == StudioState.IDLE
+    assert "Camera preview server" in (tmp_path / "var/log/studio/preview.log").read_text()
+
+
+def test_preview_readiness_is_emitted_after_delayed_startup(tmp_path: Path) -> None:
+    run = config(tmp_path)
+    command = tmp_path / "polima"
+    command.write_text(
+        "#!/bin/sh\n"
+        "sleep 0.05\n"
+        "echo 'Camera preview server: http://127.0.0.1:5001/token/'\n"
+        "sleep 0.2\n"
+    )
+    command.chmod(0o755)
+    runtime = StudioRuntime(tmp_path, command=command)
+    emitted = []
+    runtime.emit = lambda kind, **data: emitted.append({"type": kind, **data})
+
+    runtime.start_preview("demo", run.overhead_camera, run.wrist_camera)
+    # This is the snapshot timing that previously stranded the UI: the child
+    # is running, but has not announced its stream URL yet.
+    assert runtime.snapshot()["preview_url"] is None
+    deadline = time.time() + 2
+    while not any(event["type"] == "preview" for event in emitted) and time.time() < deadline:
+        time.sleep(0.01)
+
+    event = next(event for event in emitted if event["type"] == "preview")
+    assert event["url"] == "http://127.0.0.1:5001/token/"
+    runtime.close()
+
+
+def test_control_stop_waits_for_client_then_stops_server(tmp_path: Path) -> None:
+    run = config(tmp_path)
+    command = tmp_path / "polima"
+    marker = tmp_path / "server-stopped"
+    command.write_text(
+        "#!/bin/sh\n"
+        f"marker='{marker}'\n"
+        "if [ \"$1\" = server ]; then echo \"$2\" > \"$marker\"; exit 0; fi\n"
+        "trap 'exit 0' INT\n"
+        "echo 'Camera preview server: http://127.0.0.1:5001/token/'\n"
+        "while :; do sleep 0.05; done\n"
+    )
+    command.chmod(0o755)
+    runtime = StudioRuntime(tmp_path, command=command)
+    runtime.start_preview("demo", run.overhead_camera, run.wrist_camera)
+
+    stopped = runtime.stop_control()
+    assert stopped["server_stopping"] is True
+    deadline = time.time() + 2
+    while (
+        (not marker.exists() or runtime.state != StudioState.IDLE)
+        and time.time() < deadline
+    ):
+        time.sleep(0.01)
+
+    assert marker.read_text().strip() == "stop"
+    assert runtime.state == StudioState.IDLE
+
+
+def test_bundle_listing_exposes_launcher_task_and_manifest_tasks(tmp_path: Path) -> None:
+    models = tmp_path / "models"
+    legacy = models / "legacy"
+    legacy.joinpath("robot_client").mkdir(parents=True)
+    legacy.joinpath("bundle.json").write_text('{"policy":"act"}')
+    legacy.joinpath("robot_client/start.sh").write_text(
+        'TASK="${POLIMA_TASK:-Place the grey eraser in white basket.}"\n'
+    )
+    modern = models / "modern"
+    modern.mkdir()
+    modern.joinpath("bundle.json").write_text(
+        '{"policy":"smolvla","default_task":"Pick red cube.",'
+        '"tasks":["Pick blue cube."]}'
+    )
+    fixed = models / "fixed"
+    fixed.joinpath("robot_client").mkdir(parents=True)
+    fixed.joinpath("bundle.json").write_text('{"policy":"act"}')
+    fixed.joinpath("robot_client/start.sh").write_text(
+        'exec client --task="Place the yellow cube in the tray." --policy_type=act\n'
+    )
+
+    bundles = {item["id"]: item for item in StudioRuntime(tmp_path).bundles()}
+    assert bundles["legacy"]["default_task"] == "Place the grey eraser in white basket."
+    assert bundles["legacy"]["tasks"] == ["Place the grey eraser in white basket."]
+    assert bundles["modern"]["tasks"] == ["Pick red cube.", "Pick blue cube."]
+    assert bundles["fixed"]["default_task"] == "Place the yellow cube in the tray."
+
+
+def test_api_requires_csrf_and_controller_lease(tmp_path: Path) -> None:
+    pytest.importorskip("flask")
+    from polima.studio.app import create_app
+
+    runtime = StudioRuntime(tmp_path)
+    client = create_app(tmp_path, runtime).test_client()
+    assert client.post("/api/v1/robot/stop").status_code == 403
+    session = client.get("/api/v1/session").get_json()
+    headers = {"X-CSRF-Token": session["csrf_token"]}
+    lease = client.post("/api/v1/lease", json={}, headers=headers).get_json()
+    headers["X-Controller-Lease"] = lease["token"]
+    assert client.post("/api/v1/robot/stop", json={}, headers=headers).status_code == 200
+    # Emergency halt deliberately does not require the controller lease.
+    assert client.post(
+        "/api/v1/robot/halt", json={}, headers={"X-CSRF-Token": session["csrf_token"]}
+    ).status_code == 200
+
+
+def test_parse_benchmark_output() -> None:
+    result = parse_benchmark_output(
+        "  min 20.1 / mean 21.0 / median 20.8 / p95 22.4 / p99 23.0 / max 23.0 "
+        "ms over 50 runs (3 warm-up)\n"
+        "  total 21.2 ms\n"
+        "    run_elf:vision=5.100000\n"
+        "    run_elf:vision=5.200000\n"
+        "  PASS  cosine=0.999990 mean_abs=0.000100 max_abs=0.001000\n"
+    )
+    assert result is not None
+    assert result["p95"] == 22.4
+    assert result["throughput_hz"] == pytest.approx(47.619)
+    assert result["stages"] == [
+        {"name": "run_elf:vision", "ms": 5.1},
+        {"name": "run_elf:vision", "ms": 5.2},
+    ]
+    assert result["validation"]["status"] == "pass"
+
+
+def test_benchmark_failure_preserves_native_diagnostic() -> None:
+    output = (
+        "  failed to load demo: Connecting to server failed\n"
+        "  nothing is loaded now\n"
+        "polima>   no model loaded -- `use <n>` first\n"
+    )
+    assert benchmark_failure(output) == "failed to load demo: Connecting to server failed"
+
+
+def test_process_failure_exposes_actionable_recent_output() -> None:
+    assert process_failure(
+        "robot", 1, ["opening devices", "Error: wrist camera permission denied"]
+    ) == "robot: Error: wrist camera permission denied"
+    assert process_failure("preview", 2, ["starting"]) == (
+        "preview exited with code 2; check Runtime Events for details"
+    )
+
+
+def test_hardware_free_benchmark_is_supervised_and_persisted(tmp_path: Path) -> None:
+    run = config(tmp_path)
+    (tmp_path / "models/demo/fixtures/inputs").mkdir(parents=True)
+    command = tmp_path / "polima"
+    command.write_text(
+        "#!/bin/sh\n"
+        "read a; read b; read c; read d\n"
+        "echo '  min 9.0 / mean 10.0 / median 10.0 / p95 11.0 / p99 12.0 / max 12.0 ms over 20 runs (2 warm-up)'\n"
+        "echo '    run_elf:vision=4.000000'\n"
+        "echo '  PASS  cosine=1.000000 mean_abs=0.000000 max_abs=0.000000'\n"
+    )
+    command.chmod(0o755)
+    runtime = StudioRuntime(tmp_path, command=command)
+    started = runtime.start_benchmark("demo", 20, 2)
+    assert started["state"] == "benchmarking"
+    deadline = time.time() + 2
+    while (
+        runtime.store.list_benchmarks()[0]["status"] == "running"
+        and time.time() < deadline
+    ):
+        time.sleep(0.01)
+    benchmarks = runtime.store.list_benchmarks()
+    assert benchmarks[0]["status"] == "completed"
+    assert benchmarks[0]["result"]["mean"] == 10.0
+    assert benchmarks[0]["result"]["validation"]["status"] == "pass"
+    assert run.bundle == "demo"
+
+
+# ------------------------------------------------- autocomplete / reset / lease
+
+
+def _run_config(**overrides):
+    from polima.studio.models import RunConfig
+
+    base = {"bundle": "b", "task": "t", "robot_port": "/dev/ttyACM0",
+            "overhead_camera": "cam0", "wrist_camera": "cam1"}
+    return RunConfig.from_json({**base, **overrides})
+
+
+def test_autocomplete_defaults_on_and_round_trips():
+    assert _run_config().autocomplete is True
+    assert _run_config(autocomplete=False).autocomplete is False
+    assert _run_config(autocomplete=False).to_json()["autocomplete"] is False
+
+
+def test_autocomplete_reaches_the_launcher_under_the_policys_own_name(tmp_path, monkeypatch):
+    """The launcher hardcodes `${<POLICY>_AUTO_COMPLETE:-1}` with no POLIMA_
+    spelling, so a generic variable alone is silently ignored and the arm keeps
+    running the grasp-release detector."""
+    from polima.studio.runtime import StudioRuntime
+
+    engine = StudioRuntime(tmp_path)
+    bundle = tmp_path / "models" / "b"
+    bundle.mkdir(parents=True)
+    (bundle / "bundle.json").write_text('{"policy": "smolvla"}')
+
+    captured: dict = {}
+    monkeypatch.setattr(engine, "_spawn",
+                        lambda *a, **k: captured.update(env=a[4] if len(a) > 4 else k.get("env")))
+    monkeypatch.setattr(engine.store, "begin_run", lambda *a, **k: 1)
+    token = "t"
+    import json as _json
+    import time as _time
+    engine._arm_tokens[token] = (
+        _time.time() + 60, _json.dumps(_run_config(bundle="b", autocomplete=False).to_json(),
+                                       sort_keys=True))
+
+    engine.start_robot(_run_config(bundle="b", autocomplete=False), token)
+    assert captured["env"]["SMOLVLA_AUTO_COMPLETE"] == "0"
+    assert captured["env"]["POLIMA_AUTO_COMPLETE"] == "0"
+
+
+def test_lease_is_taken_over_rather_than_refused():
+    """A stale tab used to lock everyone out for the rest of the 30s lease."""
+    import tempfile
+    from pathlib import Path
+
+    from polima.studio.runtime import Conflict, StudioRuntime
+
+    engine = StudioRuntime(Path(tempfile.mkdtemp()))
+    first = engine.claim_lease(owner="browser-A")
+    second = engine.claim_lease(owner="browser-B")
+
+    assert second["token"] != first["token"], "the newcomer gets a fresh baton"
+    engine.require_lease(second["token"])
+    with pytest.raises(Conflict):
+        engine.require_lease(first["token"])
+
+
+def test_lease_takeover_is_announced():
+    import tempfile
+    from pathlib import Path
+
+    from polima.studio.runtime import StudioRuntime
+
+    engine = StudioRuntime(Path(tempfile.mkdtemp()))
+    engine.claim_lease(owner="browser-A")
+    engine.claim_lease(owner="browser-B")
+    assert any(e.get("type") == "lease" and e.get("event") == "taken_over"
+               for e in engine._events)
+
+
+def test_reset_clears_the_lease_so_recovery_is_not_blocked_by_it(tmp_path, monkeypatch):
+    from polima.deploy import mla
+    from polima.studio.runtime import StudioRuntime
+
+    engine = StudioRuntime(tmp_path)
+    engine.claim_lease(owner="a-dead-tab")
+    monkeypatch.setattr(mla, "reset", lambda *a, **k: mla.ResetReport(True, "recovery-script"))
+    monkeypatch.setattr(engine, "server_status", lambda: {"running": False})
+
+    result = engine.reset()
+    assert result["ok"] and engine._lease_token is None
+    # Whoever is recovering can take control immediately.
+    assert engine.claim_lease(owner="the-operator")["token"]
+
+
+def test_reset_route_needs_no_controller_lease():
+    """A recovery path that the wedge itself can block is not a recovery path."""
+    import inspect
+
+    from polima.studio import app as studio_app
+
+    source = inspect.getsource(studio_app.create_app)
+    reset = source.split('"/api/v1/system/reset"', 1)[1].split("@app.", 1)[0]
+    assert "lease=False" in reset
