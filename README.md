@@ -35,7 +35,7 @@ Both halves share one core — `polima.policies`, `polima.wire`, `polima.bundle`
 
 So the core carries a hard dependency floor of **stdlib + numpy**, and it must import in all three interpreters:
 
-- the `act` conda env (py3.12 + torch)
+- the self-contained PoLiMa `.venv` (py3.12 + torch + LeRobot)
 - the SiMa model-compiler venv (py3.12 + `afe`, **no torch**)
 - the board's py3.11
 
@@ -45,14 +45,59 @@ Invoking a stage on the wrong machine exits `3` with one actionable sentence, ra
 
 ---
 
+## Prerequisites
+
+**The SiMa Model Compiler (ModelSDK) is required and is not part of this
+repository.** It is proprietary and licensed, so it cannot be vendored or
+installed by `make venv`; you obtain it from the SiMa Developer Portal (via
+`sima-cli`, or the Palette `modelsdk` container). Everything except
+quantization and compilation works without it — export, packing, deploy, run,
+the robot client and Studio — but `polima compile` cannot do its job, because
+`afe` lives inside the ModelSDK and nowhere else.
+
+Point PoLiMa at it once installed:
+
+```bash
+export MODEL_COMPILER_BIN=/path/to/model-compiler/bin   # the dir holding its python
+polima doctor                                           # verifies afe imports
+```
+
+Developed and verified against **ModelSDK 2.1.0**. The version participates in
+the compile resume key, so upgrading it invalidates cached ELFs and recompiles
+— by design, since an AFE upgrade changes code generation while every input
+stays byte-identical.
+
+If it is missing or misconfigured, `polima compile` says so and names the
+interpreter it tried, rather than failing later inside AFE:
+
+```
+polima-compile: /path/to/python cannot import afe.
+  Sourced .../activate-model-compiler and it still fails.
+  Set MODEL_COMPILER_BIN, or run from the modelsdk environment.
+```
+
+That activation step matters: without it `import afe` fails on a missing
+`libLLVM`, which is why `bin/polima` sources `activate-model-compiler` when it
+finds one.
+
+---
+
 ## Install
 
 **Host**
 ```bash
-conda activate act
-pip install -e "polima[host]"
+cd polima
+make venv
+source .venv/bin/activate
 polima-doctor
 ```
+
+The project-local `.venv` owns the ordinary PoLiMa CLI, dataset validation,
+tests, CPU-only Torch/LeRobot export stack, and deployment dependencies. CUDA
+is not required. It never uses a Conda environment. Only the proprietary
+ModelSDK extension remains external; PoLiMa launches AFE through
+`MODEL_COMPILER_BIN` while all checkpoint loading and ONNX export stays inside
+`.venv`.
 
 **Palette modelsdk container** — no install; the launcher resolves its own location, so it works at whatever path the workspace is mounted:
 
@@ -66,9 +111,54 @@ polima compile --build-dir <dir>
 **Board**
 ```bash
 ssh sima@192.168.91.211
-pip install -e "/media/nvme/polima/src[robot]"
-polima-doctor
+cd /path/to/polima
+./scripts/install_polima_modalix.sh
+polima robot status
 ```
+
+The installer builds the native `polima_server` and `polima_cli`, exposes the
+device command as `polima`, and reuses or provisions `/media/nvme/lerobot` via
+the sibling `lerobot_sima/install_lerobot_modalix.sh`. After deploying a bundle,
+`polima robot run` starts the matching policy server and runs the bundled
+LeRobot control client in the foreground.
+
+Device lifecycle commands:
+
+```bash
+polima activate                    # interactively select an installed bundle
+polima activate 2                  # or select by list number
+polima activate <bundle-id>        # or exact bundle id
+polima activate 2 --start          # activate and start it in one operation
+polima server status             # inspect the background policy server
+polima server start              # serve /media/nvme/polima/current
+polima server stop
+polima robot status              # LeRobot env, follower arm, camera assignments
+polima robot run                 # start server, then control the arm in foreground
+polima robot preview             # browser camera view only; no server or arm
+```
+
+Activation is performed entirely on the device and atomically updates
+`/media/nvme/polima/current`. If a policy server is running, activation stops it
+first so its reported bundle cannot disagree with the model it actually loaded;
+start it again with `polima server start`.
+The interactive command asks whether to start the selected bundle; scripts can
+request the same combined handoff with `--start`.
+If no managed bundle is active, interactive `polima server start` presents the
+same bundle selector, activates the choice, and starts it. In a script, select
+explicitly with `polima activate <bundle-id>` (or use `--bundle DIR`).
+
+Running `polima server` or `polima robot` without an action opens a guided
+prompt using the active bundle. An explicit `polima robot run` still confirms
+before motion; unattended invocation must opt in with `--yes`.
+
+`polima robot run` refuses to start unless exactly one follower arm and both
+bundle-declared cameras are resolved. Ctrl-C stops robot control but intentionally
+leaves the policy server loaded; use `polima server stop` to release it.
+
+While robot control is running, the client prints a tokenized live-preview URL
+such as `http://<board-ip>:5001/<token>/`. Open it from a browser on the same
+network to view both camera feeds. The preview reuses the frames already read by
+LeRobot and does not open the camera devices a second time.
 
 ---
 
@@ -125,7 +215,8 @@ the real board rather than asserted:
 | `polima-deploy` / `polima-run` | working | 20.8 ms on the SoM, cosine 0.999990 vs PyTorch — 24% faster than the hand-written `act_llima` at 27.0 ms |
 | `polima-compile` | working | checkpoint → ONNX → ELF → bundle reproduces **byte for byte**, landing on the same content-addressed bundle id as the one deployed ([export](docs/export.md), [compile](docs/compile.md)) |
 | `polima-robot` | Phase 1d | |
-| SmolVLA / GR00T | Phases 4–5 | |
+| SmolVLA | native checkpoint export + compile integrated; hardware validation pending | ONNX chain max abs `1.67e-6`; suffix and vision accepted by ModelSDK 2.1.0 |
+| GR00T | Phase 5 | |
 
 The compile stage replaces three divergent copies of
 `sima_compile_onnx_tensors.py` (518 lines) plus two per-policy controllers with
@@ -139,6 +230,7 @@ polima compile --build-dir <dir>                       # recompile what changed
 polima compile --import-legacy <dir>                   # adopt an existing tree
 polima deploy --bundle <bundle>                        # deploy only; does not serve
 polima deploy --bundle <bundle> --start                # explicitly start serving
+polima deploy                                          # interactive bundle/board setup
 ```
 
 ### On the board
@@ -161,3 +253,28 @@ act-rcwb_f_t-100000-a3573dae> stages
 `models` / `use` / `run` / `bench` / `stages` / `check` / `info` / `save`, with
 history, cursor keys and tab completion. `--bundle` still runs once and exits.
 Deploy links `polima-cli` and `polima-server` onto `PATH`, next to `llima`.
+
+### PoLiMa Studio
+
+The board installer registers a SOM-resident web cockpit, disabled and stopped
+by default. Studio provides camera-only MJPG preview, bundle and
+policy-server management, hardware assignment, guarded robot runs, guided
+calibration, diagnostics, logs, and bounded run history. One browser holds the
+controller lease while all observers retain access to the emergency halt.
+It also provides isolated, hardware-free fixture benchmarks with warm-up,
+latency percentiles, throughput, per-stage timings, and output verification.
+
+```bash
+polima studio status             # service state and URL
+polima studio start              # start for this boot
+polima studio enable             # opt in to starting at boot
+polima studio stop               # stop without changing boot preference
+polima studio disable            # stop and disable at boot
+polima studio logs [-f]          # recent or following service logs
+polima studio serve --port 8080  # foreground, without systemd
+```
+
+Robot start requires a successful preflight followed by confirmation within
+15 seconds. Normal stop returns to the dataset rest pose; **HALT NOW** skips
+that motion and immediately disconnects the follower. See
+[docs/polima-studio.md](docs/polima-studio.md) for deployment and API details.
