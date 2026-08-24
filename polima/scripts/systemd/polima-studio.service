@@ -1,0 +1,25 @@
+[Unit]
+Description=PoLiMa Studio robot operations cockpit
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/polima-studio
+ExecStart=/media/nvme/lerobot/bin/python -m polima.studio.main
+Restart=on-failure
+RestartSec=3
+KillMode=mixed
+TimeoutStopSec=12
+User=sima
+Group=sima
+SupplementaryGroups=dialout video
+NoNewPrivileges=true
+# SimaLMM reaches the board MLA runtime through host IPC. A private /tmp makes
+# model loading fail with "Connecting to server failed" for Studio children.
+PrivateTmp=false
+ProtectSystem=full
+ReadWritePaths=/media/nvme/polima
+
+[Install]
+WantedBy=multi-user.target
