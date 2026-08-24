@@ -118,7 +118,7 @@ polima robot status
 
 The installer builds the native `polima_server` and `polima_cli`, exposes the
 device command as `polima`, and reuses or provisions `/media/nvme/lerobot` via
-the sibling `lerobot_sima/install_lerobot_modalix.sh`. After deploying a bundle,
+the included `lerobot_sima/install_lerobot_modalix.sh`. After deploying a bundle,
 `polima robot run` starts the matching policy server and runs the bundled
 LeRobot control client in the foreground.
 

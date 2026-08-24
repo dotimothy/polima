@@ -7,7 +7,7 @@ SOURCE="${POLIMA_NATIVE_SOURCE:-$(cd -- "$SCRIPT_DIR/../native" && pwd)}"
 POLIMA_SOURCE="${POLIMA_SOURCE:-$(cd -- "$SCRIPT_DIR/.." && pwd)}"
 ROOT="${POLIMA_ROOT:-/media/nvme/polima}"
 LEROBOT_VENV="${LEROBOT_VENV:-/media/nvme/lerobot}"
-LEROBOT_INSTALLER="${LEROBOT_INSTALLER:-$(cd -- "$SCRIPT_DIR/../.." && pwd)/lerobot_sima/install_lerobot_modalix.sh}"
+LEROBOT_INSTALLER="${LEROBOT_INSTALLER:-$POLIMA_SOURCE/lerobot_sima/install_lerobot_modalix.sh}"
 JOBS="${JOBS:-$(nproc)}"
 
 fail() { echo "[fail] $*" >&2; exit 1; }
@@ -19,7 +19,7 @@ mkdir -p "$ROOT/bin" "$ROOT/build" "$ROOT/var/log" "$ROOT/var/run"
 
 if [[ ! -x "$LEROBOT_VENV/bin/python" ]]; then
     [[ "${SKIP_LEROBOT:-0}" != 1 ]] || fail "LeRobot venv is absent and SKIP_LEROBOT=1"
-    [[ -x "$LEROBOT_INSTALLER" ]] || fail "LeRobot installer not found at $LEROBOT_INSTALLER"
+    [[ -x "$LEROBOT_INSTALLER" ]] || fail "LeRobot installer not found at $LEROBOT_INSTALLER; initialize a complete PoLiMa checkout or set LEROBOT_INSTALLER"
     log "Installing the standalone LeRobot environment"
     VENV="$LEROBOT_VENV" "$LEROBOT_INSTALLER"
 else
