@@ -37,6 +37,30 @@ bool starts_with(const std::string& text, const std::string& prefix) {
 
 void supervisor_noop(int) {}
 
+std::vector<std::string> default_camera_hints(const std::string& role) {
+  // Bundle hints remain authoritative, but these vendor/model families make
+  // an ACT bundle built for a C920 work with the board's C922 replacement.
+  // This is deliberately a list of stable by-id names, never /dev/videoN.
+  if (role == "overhead") return {"c920", "c922", "logitech", "046d"};
+  if (role == "wrist") return {"sonix", "cam1", "usb2.0_cam1"};
+  return {};
+}
+
+std::vector<const CameraDevice*> matching_cameras(
+    const std::vector<CameraDevice>& cameras, const std::vector<std::string>& hints,
+    const std::vector<std::string>& taken) {
+  std::vector<const CameraDevice*> matches;
+  for (const auto& camera : cameras) {
+    if (std::find(taken.begin(), taken.end(), camera.path) != taken.end()) continue;
+    const std::string name = lowered(camera.name);
+    if (std::any_of(hints.begin(), hints.end(), [&](const std::string& hint) {
+          return name.find(lowered(hint)) != std::string::npos;
+        }))
+      matches.push_back(&camera);
+  }
+  return matches;
+}
+
 }  // namespace
 
 std::vector<CameraDevice> list_cameras(const fs::path& by_id) {
@@ -139,23 +163,17 @@ CameraAssignment assign_cameras(const RobotDescription& description,
   for (const auto& [role, label] : description.roles) {
     (void)label;
     const auto hint = description.hints.find(role);
-    if (hint == description.hints.end() || hint->second.empty()) {
-      result.problems.push_back(role + ": no camera hint in the bundle");
-      continue;
-    }
-    std::vector<const CameraDevice*> matches;
-    for (const auto& camera : cameras) {
-      if (lowered(camera.name).find(lowered(hint->second)) == std::string::npos) continue;
-      if (std::find(taken.begin(), taken.end(), camera.path) != taken.end()) continue;
-      matches.push_back(&camera);
-    }
+    std::vector<std::string> hints;
+    if (hint != description.hints.end() && !hint->second.empty()) hints.push_back(hint->second);
+    std::vector<const CameraDevice*> matches = matching_cameras(cameras, hints, taken);
+    if (matches.empty()) matches = matching_cameras(cameras, default_camera_hints(role), taken);
     if (matches.empty()) {
-      result.problems.push_back(role + ": no camera matching '" + hint->second + "'");
+      result.problems.push_back(role + ": no matching " + role + " camera");
       continue;
     }
     if (matches.size() > 1) {
       result.problems.push_back(role + ": " + std::to_string(matches.size()) +
-                                " cameras match '" + hint->second + "'");
+                                " cameras match; pass --" + role + "-camera");
       continue;
     }
     // Deliberately never falls back on enumeration order: /dev/videoN is

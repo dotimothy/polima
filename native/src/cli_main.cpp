@@ -105,6 +105,43 @@ void print_robot(const polima::RobotDescription& description,
   for (const auto& problem : assignment.problems) std::cout << "  ! " << problem << "\n";
 }
 
+std::string prompt_device(const std::string& label,
+                          const std::vector<std::string>& candidates,
+                          const std::string& detected) {
+  if (candidates.empty())
+    throw std::runtime_error("no " + label + " devices detected");
+
+  std::cout << "\n" << label << ":\n";
+  for (size_t index = 0; index < candidates.size(); ++index) {
+    std::cout << "  " << index + 1 << ") " << candidates[index];
+    if (candidates[index] == detected) std::cout << " <- detected default";
+    std::cout << "\n";
+  }
+  std::cout << "Select " << label;
+  if (!detected.empty()) std::cout << " (Enter uses detected default)";
+  std::cout << ": " << std::flush;
+
+  std::string selection;
+  if (!std::getline(std::cin, selection)) return "";
+  if (selection.empty()) return detected;
+  char* end = nullptr;
+  const long number = std::strtol(selection.c_str(), &end, 10);
+  if (end != selection.c_str() && *end == '\0' && number >= 1 &&
+      static_cast<size_t>(number) <= candidates.size())
+    return candidates[static_cast<size_t>(number - 1)];
+  throw std::runtime_error("select " + label + " by number, or press Enter for the default");
+}
+
+std::vector<std::string> camera_paths(const std::vector<polima::CameraDevice>& cameras,
+                                      const std::vector<std::string>& excluded) {
+  std::vector<std::string> paths;
+  for (const auto& camera : cameras) {
+    if (std::find(excluded.begin(), excluded.end(), camera.path) == excluded.end())
+      paths.push_back(camera.path);
+  }
+  return paths;
+}
+
 std::string prompt_bundle(const fs::path& store) {
   const auto entries = polima::scan_store(store);
   if (entries.empty()) {
@@ -259,22 +296,7 @@ int device_command(int argc, char** argv, const polima::Args& args) {
     const fs::path python = args.get("--lerobot-venv", "/media/nvme/lerobot") + "/bin/python";
     std::cout << "lerobot\n  " << (fs::exists(python) ? python.string() : "missing") << "\n";
     if (!action.empty() || !interactive) return 0;
-    if (ports.size() != 1) {
-      std::cout << "not ready: connect exactly one follower arm, or use "
-                   "--robot-port with `polima robot run`\n";
-      return 1;
-    }
-    for (const auto& [role, label] : description.roles) {
-      (void)label;
-      if (!assignment.assigned.count(role)) {
-        std::cout << "not ready: assign camera " << role << "\n";
-        return 1;
-      }
-    }
-    if (!confirm("Start the policy server and robot client? The follower arm may move")) {
-      std::cout << "nothing started\n";
-      return 0;
-    }
+    std::cout << "Choose the follower and camera devices before starting.\n";
     action = "run";
   }
   if (action == "preview") {
@@ -306,28 +328,54 @@ int device_command(int argc, char** argv, const polima::Args& args) {
 
   std::string robot_port = args.get("--robot-port", "");
   if (robot_port.empty()) {
-    if (ports.size() != 1)
-      throw std::runtime_error("select one follower arm with --robot-port");
-    robot_port = ports.front();
+    const std::string detected = ports.size() == 1 ? ports.front() : "";
+    if (interactive && !args.has("--yes")) {
+      robot_port = prompt_device("follower serial interface", ports, detected);
+      if (robot_port.empty()) {
+        std::cout << "nothing started\n";
+        return 0;
+      }
+    } else {
+      if (ports.size() != 1)
+        throw std::runtime_error("select one follower arm with --robot-port");
+      robot_port = ports.front();
+    }
   }
   if (!fs::exists(robot_port))
     throw std::runtime_error("follower arm not found at " + robot_port);
+
+  const auto cameras = polima::list_cameras();
+  std::vector<std::string> selected_cameras;
   for (const auto& [role, label] : description.roles) {
     (void)label;
+    const std::string option = "--" + role + "-camera";
+    if (!args.has(option) && interactive && !args.has("--yes")) {
+      const auto found = assignment.assigned.find(role);
+      const std::string detected = found == assignment.assigned.end() ? "" : found->second;
+      const std::string selected = prompt_device(role + " camera",
+                                                 camera_paths(cameras, selected_cameras), detected);
+      if (selected.empty()) {
+        std::cout << "nothing started\n";
+        return 0;
+      }
+      assignment.assigned[role] = selected;
+    }
     if (!assignment.assigned.count(role))
       throw std::runtime_error("camera " + role + " is unassigned; pass --" + role + "-camera");
     if (!fs::exists(assignment.assigned.at(role)))
       throw std::runtime_error("camera " + role + " not found at " + assignment.assigned.at(role));
+    if (std::find(selected_cameras.begin(), selected_cameras.end(), assignment.assigned.at(role)) !=
+        selected_cameras.end())
+      throw std::runtime_error("the same camera was selected for more than one role");
+    selected_cameras.push_back(assignment.assigned.at(role));
   }
 
   const int port = args.get_int("--port", description.default_port);
   if (port <= 0) throw std::runtime_error("bundle declares no server port");
-  if (!args.has("--yes") && !action.empty()) {
+  if (!args.has("--yes")) {
     if (!interactive)
       throw std::runtime_error("robot control needs confirmation; pass --yes for non-interactive use");
-    // A bare `polima robot` already confirmed immediately above.
-    if (argc >= 3 && !confirm(
-            "Start the policy server and robot client? The follower arm may move")) {
+    if (!confirm("Start the policy server and robot client? The follower arm may move")) {
       std::cout << "nothing started\n";
       return 0;
     }
@@ -380,6 +428,7 @@ int main(int argc, char** argv) {
         "                         [--overhead-camera PATH --wrist-camera PATH]\n"
         "                         [--preview-port N]\n"
         "                         [--fps N --actions-per-chunk N --max-relative-target DEG]\n"
+        "                         (run interactively picks detected serial and cameras)\n"
         "\nWith no --bundle it opens an interactive session over the model\n"
         "store: the model loads once and every command after that is fast.\n";
       return 0;
