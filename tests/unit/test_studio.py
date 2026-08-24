@@ -99,6 +99,25 @@ def test_missing_follower_calibration_blocks_arming(tmp_path: Path) -> None:
         runtime.arm(run)
 
 
+def test_studio_calibration_uses_polima_robot_command(tmp_path: Path, monkeypatch) -> None:
+    run = config(tmp_path)
+    (tmp_path / "models/demo/bundle.json").write_text('{"policy":"act"}')
+    command = tmp_path / "polima"
+    command.touch()
+    command.chmod(0o755)
+    runtime = StudioRuntime(tmp_path, command=command)
+    captured: list[object] = []
+    monkeypatch.setattr(runtime, "_spawn", lambda *args, **kwargs: captured.extend(args))
+
+    runtime.start_calibration("demo", run.robot_port)
+
+    assert captured[0:2] == ["calibration", [
+        str(command), "robot", "--policy", "act", "calibrate", "--yes",
+        "--robot-port", run.robot_port, "--calibration-dir",
+        str(tmp_path / "models/demo/robot_client/calibration"),
+    ]]
+
+
 def test_store_records_and_prunes_runs(tmp_path: Path) -> None:
     store = StudioStore(tmp_path / "studio.sqlite3", max_runs=2)
     for index in range(3):

@@ -83,6 +83,11 @@ def run(argv: list[str], parent: argparse.Namespace | None = None) -> int:
         if name == "run":
             child.add_argument("--fps", type=int, default=None)
             child.add_argument("--no-live-view", action="store_true")
+        if name == "calibrate":
+            child.add_argument("--calibration-dir", default=None,
+                               help="directory containing this arm's calibration file")
+            child.add_argument("--yes", action="store_true",
+                               help="skip the outer recalibration confirmation")
 
     args = parser.parse_args(argv)
     if args.command == "install":
@@ -293,7 +298,9 @@ def robot_python() -> str | None:
     return found.python if found and found.usable else None
 
 
-def _calibration_file(spec) -> Path:
+def _calibration_file(spec, calibration_dir: str | None = None) -> Path:
+    if calibration_dir:
+        return Path(calibration_dir) / f"{spec.robot.calibration_id}.json"
     return (Path.home() / ".cache" / "huggingface" / "lerobot" / "calibration"
             / "robots" / "so_follower" / f"{spec.robot.calibration_id}.json")
 
@@ -315,7 +322,7 @@ def _calibrate(spec, args) -> int:
             print(f"  ! {problem}", file=sys.stderr)
         return 1
 
-    calibration = _calibration_file(spec)
+    calibration = _calibration_file(spec, args.calibration_dir)
     if calibration.is_file():
         stamp = time.strftime("%Y%m%d_%H%M%S")
         backup = calibration.with_suffix(f".json.bak.{stamp}")
@@ -324,10 +331,11 @@ def _calibrate(spec, args) -> int:
     else:
         print(f"  no existing calibration at {calibration}")
 
-    answer = input(f"  recalibrate {spec.robot.calibration_id} on {arm}? [y/N] ").strip().lower()
-    if not answer.startswith("y"):
-        print("  cancelled")
-        return 0
+    if not args.yes:
+        answer = input(f"  recalibrate {spec.robot.calibration_id} on {arm}? [y/N] ").strip().lower()
+        if not answer.startswith("y"):
+            print("  cancelled")
+            return 0
 
     python = robot_python()
     if python is None:
@@ -343,5 +351,5 @@ def _calibrate(spec, args) -> int:
         "--robot.type=so101_follower",
         f"--robot.port={arm}",
         f"--robot.id={spec.robot.calibration_id}",
-        f"--robot.calibration_dir={calibration.parent.parent.parent}",
+        f"--robot.calibration_dir={calibration.parent if args.calibration_dir else calibration.parent.parent.parent}",
     ]).returncode

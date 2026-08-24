@@ -241,12 +241,9 @@ class StudioRuntime:
             backup.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(current, backup)
             self.store.set("last_calibration_backup", {"source": str(current), "backup": str(backup)})
-        command = Path(os.environ.get("LEROBOT_VENV", "/media/nvme/lerobot")) / "bin/lerobot-calibrate"
-        if not command.exists():
-            raise ValueError(f"calibration tool not found at {command}")
         args = [
-            str(command), "--robot.type=so101_follower", f"--robot.port={robot_port}",
-            "--robot.id=so-arm101", f"--robot.calibration_dir={calibration_dir}",
+            str(self.command), "robot", "--policy", self._policy_of(bundle), "calibrate", "--yes",
+            "--robot-port", robot_port, "--calibration-dir", str(calibration_dir),
         ]
         self._spawn(
             "calibration", args, StudioState.CALIBRATING,

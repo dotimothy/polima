@@ -351,7 +351,11 @@ int main(int argc, char** argv) {
   try {
     if (argc >= 2) {
       const std::string command = argv[1];
-      if (command == "studio" || command == "help")
+      const bool robot_calibrate = command == "robot" &&
+          std::any_of(argv + 2, argv + argc, [](const char* value) {
+            return std::string(value) == "calibrate";
+          });
+      if (command == "studio" || command == "help" || robot_calibrate)
         return run_python_command(command, argc, argv);
     }
 
