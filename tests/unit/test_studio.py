@@ -19,6 +19,9 @@ from polima.studio.store import StudioStore
 def config(root: Path) -> RunConfig:
     bundle = root / "models/demo"
     bundle.mkdir(parents=True)
+    calibration = bundle / "robot_client/calibration/so-arm101.json"
+    calibration.parent.mkdir(parents=True)
+    calibration.write_text("{}")
     devices = root / "devices"
     devices.mkdir()
     for name in ("arm", "overhead", "wrist"):
@@ -83,6 +86,17 @@ def test_arming_token_is_bound_to_exact_config(tmp_path: Path) -> None:
     with pytest.raises(Conflict, match="does not match"):
         runtime.start_robot(changed, armed["arming_token"])
     assert runtime.state == StudioState.IDLE
+
+
+def test_missing_follower_calibration_blocks_arming(tmp_path: Path) -> None:
+    runtime = StudioRuntime(tmp_path, command=tmp_path / "polima")
+    runtime.command.touch()
+    runtime.command.chmod(0o755)
+    run = config(tmp_path)
+    (tmp_path / "models/demo/robot_client/calibration/so-arm101.json").unlink()
+
+    with pytest.raises(ValueError, match="follower-arm calibration"):
+        runtime.arm(run)
 
 
 def test_store_records_and_prunes_runs(tmp_path: Path) -> None:

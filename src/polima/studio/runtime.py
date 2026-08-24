@@ -226,9 +226,9 @@ class StudioRuntime:
         bundle_path = Path(self._bundle_path(bundle))
         if not Path(robot_port).exists():
             raise ValueError("follower arm is not connected")
-        calibration_dir = bundle_path / "robot_client/calibration"
+        calibration_dir = self._calibration_path(bundle).parent
         calibration_dir.mkdir(parents=True, exist_ok=True)
-        current = calibration_dir / "so-arm101.json"
+        current = self._calibration_path(bundle)
         backup = self.root / "var/lib/calibration-backups" / (
             f"{bundle}-{int(time.time())}-so-arm101.json"
         )
@@ -391,14 +391,24 @@ class StudioRuntime:
         return {"output": result.stdout.strip()}
 
     def preflight(self, config: RunConfig) -> list[dict[str, Any]]:
+        calibration = self._calibration_path(config.bundle)
         checks = [
             ("bundle", Path(self._bundle_path(config.bundle)).exists()),
             ("follower arm", Path(config.robot_port).exists()),
             ("overhead camera", Path(config.overhead_camera).exists()),
             ("wrist camera", Path(config.wrist_camera).exists()),
+            ("follower-arm calibration", calibration.is_file()),
             ("native control binary", self.command.exists() and os.access(self.command, os.X_OK)),
         ]
         return [{"name": name, "ok": ok} for name, ok in checks]
+
+    def _calibration_path(self, bundle: str) -> Path:
+        """The per-bundle follower calibration Studio passes to LeRobot.
+
+        A calibration is specific to the arm, so its absence is a hard safety
+        failure for robot motion—not a warning a user can accidentally skip.
+        """
+        return Path(self._bundle_path(bundle)) / "robot_client/calibration/so-arm101.json"
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
