@@ -29,6 +29,12 @@ set -euo pipefail
 VENV="${VENV:-/media/nvme/lerobot}"
 MOTORS="${MOTORS:-feetech}"
 LEROBOT_VERSION="${LEROBOT_VERSION:-0.4.4}"
+# LeRobot's permitted W&B range is broad enough that pip can select a build
+# whose generated protobufs require a newer runtime than Debian provides.
+# Pin this matching pair in the venv so --system-site-packages cannot expose
+# the incompatible system protobuf instead.
+WANDB_VERSION="${WANDB_VERSION:-0.24.2}"
+PROTOBUF_VERSION="${PROTOBUF_VERSION:-6.31.1}"
 PYTHON="${PYTHON:-python3}"
 
 log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
@@ -104,7 +110,10 @@ sys_numpy="$("$PYTHON" -c 'import numpy;print(numpy.__version__)' 2>/dev/null ||
 log "Installing lerobot[$EXTRAS]==$LEROBOT_VERSION (this pulls ~1 GB, be patient on the SOM)"
 export PIP_DISABLE_PIP_VERSION_CHECK=1
 "$VENV/bin/python" -m pip install --upgrade pip setuptools wheel
-"$VENV/bin/python" -m pip install "lerobot[$EXTRAS]==$LEROBOT_VERSION"
+"$VENV/bin/python" -m pip install \
+  "lerobot[$EXTRAS]==$LEROBOT_VERSION" \
+  "wandb==$WANDB_VERSION" \
+  "protobuf==$PROTOBUF_VERSION"
 
 # The PoLiMa robot clients expose their already-captured camera observations as
 # a tokenized MJPEG page. Flask is intentionally installed in this standalone
@@ -136,6 +145,9 @@ print(f"    python  {sys.version.split()[0]} ({platform.machine()})")
 print(f"    lerobot {md.version('lerobot')}")
 import torch; print(f"    torch   {torch.__version__}")
 import flask; print(f"    flask  {md.version('flask')}")
+import google.protobuf.runtime_version
+print(f"    protobuf {md.version('protobuf')}")
+print(f"    wandb    {md.version('wandb')}")
 for p in ("feetech-servo-sdk", "dynamixel-sdk"):
     try: print(f"    {p:<18} {md.version(p)}")
     except md.PackageNotFoundError: pass
