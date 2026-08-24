@@ -5,8 +5,10 @@
 #include <fstream>
 #include <thread>
 
+#include <arpa/inet.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -19,6 +21,19 @@ fs::path pid_path(const fs::path& root) { return root / "var" / "run" / "server.
 fs::path log_path(const fs::path& root) { return root / "var" / "log" / "server.log"; }
 
 bool alive(int pid) { return pid > 0 && ::kill(pid, 0) == 0; }
+
+bool listening(int port) {
+  const int socket = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (socket < 0) return false;
+  sockaddr_in address{};
+  address.sin_family = AF_INET;
+  address.sin_port = htons(static_cast<uint16_t>(port));
+  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  const bool connected =
+      ::connect(socket, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0;
+  ::close(socket);
+  return connected;
+}
 
 }  // namespace
 
@@ -93,7 +108,19 @@ int start_server(const fs::path& root, const fs::path& bundle, int port) {
 
   std::ofstream stream(pid_path(root));
   stream << pid << "\n";
-  return pid;
+  stream.close();
+
+  // Model loading happens before bind and can take several seconds. Returning
+  // immediately made `robot run` race the server and report a false connection
+  // failure, so starting is not considered successful until the socket opens.
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (!alive(pid)) return 0;
+    if (listening(port)) return pid;
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  ::kill(pid, SIGTERM);
+  return 0;
 }
 
 }  // namespace polima

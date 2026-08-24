@@ -5,10 +5,10 @@ the ONNX these produce has to be the same, because the ELFs compiled from it are
 the reproduction target.
 
 This module needs torch and lerobot, so it is imported only by the export stage
-running in the `act` conda env. Everything else in `polima.policies.act` stays
-numpy-only; `GraphSpec.builder` names the classes here as strings precisely so
-the spec can be read in the compiler venv and on the board, where torch does not
-exist.
+running in PoLiMa's self-contained CPU venv. Everything else in
+`polima.policies.act` stays numpy-only; `GraphSpec.builder` names the classes
+here as strings precisely so the spec can be read in the compiler venv and on
+the board, where torch does not exist.
 
 ## Why the graph boundaries are where they are
 
@@ -74,9 +74,14 @@ def load_policy(checkpoint: str | Path, lerobot_src: str | Path | None = None):
 
     if lerobot_src and str(lerobot_src) not in sys.path:
         sys.path.insert(0, str(lerobot_src))
+    from lerobot.policies.act.configuration_act import ACTConfig
     from lerobot.policies.act import ACTPolicy
 
-    policy = ACTPolicy.from_pretrained(str(checkpoint)).cpu().eval()
+    config = ACTConfig.from_pretrained(str(checkpoint), local_files_only=True)
+    config.device = "cpu"
+    policy = ACTPolicy.from_pretrained(
+        str(checkpoint), config=config, local_files_only=True
+    ).cpu().eval()
     config = policy.config
     image_keys = list(config.image_features)
 

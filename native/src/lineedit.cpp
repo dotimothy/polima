@@ -1,5 +1,6 @@
 #include "polima/lineedit.hpp"
 
+#include <cstddef>
 #include <csignal>
 #include <cstdio>
 #include <iostream>
@@ -106,7 +107,7 @@ void LineEditor::complete(std::string& buffer, size_t& cursor) const {
     buffer.replace(start, cursor - start, insert);
     cursor = start + insert.size();
     if (matches.size() == 1) {
-      buffer.insert(cursor, " ");
+      buffer.insert(buffer.begin() + static_cast<std::ptrdiff_t>(cursor), ' ');
       ++cursor;
     }
   }

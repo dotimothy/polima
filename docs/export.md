@@ -25,7 +25,9 @@ own torch code, named from `CompilePlan` as dotted strings:
 
 Strings rather than imports, because `polima.policies.act` has to stay
 importable in the compiler venv and on the board, where torch does not exist.
-Only the export stage resolves them, and it runs in the `act` conda env.
+Only the export stage resolves them, and it runs directly in PoLiMa's
+self-contained CPU-only `.venv`; CUDA is not needed for checkpoint loading,
+ONNX export, or ONNX verification.
 
 ## Verify before compile, not after
 

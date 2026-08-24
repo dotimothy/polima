@@ -28,6 +28,9 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import logging
+import os
+import threading
+import time
 from pathlib import Path
 from typing import Sequence
 
@@ -106,6 +109,77 @@ def prepare(path: str | Path, names: Sequence[str], shapes: Sequence[Shape],
     return prepared
 
 
+def promote_rank3_hwc(path: str | Path, layout: str = "NHWC") -> Path:
+    """Wrap each rank-3 [N,W,C] boundary as a layout-correct rank-4 tensor.
+
+    The reshapes are numerical no-ops. They only satisfy ModelSDK 2.1's
+    four-dimensional external-layout packaging path, which is required for
+    directly sharing an HWC MLABuffer between token stages. Rank-4 boundaries
+    are left alone, which also covers SmolVLA vision's NCHW image input and
+    rank-3 token output. NCHW graphs use [N,C,1,W], so the compiler sees the
+    real channel count while an HWC external buffer remains token-major.
+    """
+    import onnx
+
+    path = Path(path)
+    model = onnx.load(str(path))
+    if len(model.graph.input) != 1 or len(model.graph.output) != 1:
+        raise ValueError("rank-3 HWC promotion requires one input and one output")
+    graph_input, graph_output = model.graph.input[0], model.graph.output[0]
+    input_shape = [dim.dim_value for dim in graph_input.type.tensor_type.shape.dim]
+    output_shape = [dim.dim_value for dim in graph_output.type.tensor_type.shape.dim]
+    if len(input_shape) not in (3, 4) or len(output_shape) not in (3, 4):
+        raise ValueError(
+            f"expected rank-3/rank-4 I/O, got input={input_shape}, output={output_shape}"
+        )
+    if len(input_shape) == 4 and len(output_shape) == 4:
+        return path
+
+    input_name, output_name = graph_input.name, graph_output.name
+    rank3_input = input_name + "__rank3" if len(input_shape) == 3 else input_name
+    rank3_output = output_name + "__rank3" if len(output_shape) == 3 else output_name
+    for node in model.graph.node:
+        node.input[:] = [rank3_input if name == input_name else
+                         rank3_output if name == output_name else name for name in node.input]
+        node.output[:] = [rank3_output if name == output_name else name for name in node.output]
+
+    def rank4(shape: list[int]) -> list[int]:
+        if layout.upper() == "NCHW":
+            return [shape[0], shape[2], 1, shape[1]]
+        return [shape[0], 1, shape[1], shape[2]]
+
+    if len(input_shape) == 3:
+        input_shape_name = input_name + "__shape3"
+        model.graph.initializer.append(
+            onnx.helper.make_tensor(
+                input_shape_name, onnx.TensorProto.INT64, [3], input_shape
+            )
+        )
+        model.graph.node.insert(0, onnx.helper.make_node(
+            "Reshape", [input_name, input_shape_name], [rank3_input],
+            name=input_name + "__unwrap_hwc",
+        ))
+    if len(output_shape) == 3:
+        output_shape_name = output_name + "__shape4"
+        model.graph.initializer.append(onnx.helper.make_tensor(
+            output_shape_name, onnx.TensorProto.INT64, [4],
+            rank4(output_shape),
+        ))
+        model.graph.node.append(onnx.helper.make_node(
+            "Reshape", [rank3_output, output_shape_name], [output_name],
+            name=output_name + "__wrap_hwc",
+        ))
+    for value, shape in ((graph_input, input_shape), (graph_output, output_shape)):
+        if len(shape) != 3:
+            continue
+        value.type.tensor_type.shape.ClearField("dim")
+        for size in rank4(shape):
+            value.type.tensor_type.shape.dim.add().dim_value = size
+    promoted = path.with_name(f"{path.stem}_rank4_hwc.onnx")
+    onnx.save(model, promoted)
+    return promoted
+
+
 # -------------------------------------------------------------- tessellation
 
 
@@ -152,6 +226,34 @@ def tessellation_parameters(quantized):
     return params
 
 
+def external_layout_parameters(quantized, layout_name: str):
+    """Force the same external layout on every MLA input and output."""
+    from afe.apis.defines import TensorDRAMLayout, TensorTessellateParameters
+    from afe.ir.node import node_is_tuple
+
+    nodes = quantized._net.nodes
+    if "MLA_0" not in nodes:
+        raise RuntimeError(
+            "MLA_0 not found in the quantized net; cannot set an external DRAM layout"
+        )
+    mla_node = nodes["MLA_0"]
+    template = TensorTessellateParameters(
+        tile_shape=(0, 0, 0, 0), enable_mla=True,
+        dram_layout=TensorDRAMLayout[layout_name],
+    )
+    params = {
+        name: dataclasses.replace(template) for name in mla_node.input_names
+    }
+    output_node = mla_node.ir.nodes[mla_node.ir.output_node_name]
+    output_names = (
+        output_node.input_node_names if node_is_tuple(output_node) else [output_node.name]
+    )
+    params.update({
+        f"{name}_output": dataclasses.replace(template) for name in output_names
+    })
+    return params
+
+
 # --------------------------------------------------------------------- driver
 
 
@@ -178,8 +280,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-layout", choices=("NCHW", "NHWC"), default="NCHW")
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--mla-tessellation", action="store_true")
+    parser.add_argument(
+        "--external-dram-layout", choices=("compiler", "HWC", "HWC16"),
+        default="compiler", help="force one layout on every MLA input and output",
+    )
+    parser.add_argument(
+        "--promote-rank3-hwc", action="store_true",
+        help="wrap [N,W,C] graph I/O as [N,1,W,C] for explicit HWC layouts",
+    )
     parser.add_argument("--retain-compile-dir", type=Path,
                         help="keep the compiler temp dir; this is where the ELF lands")
+    parser.add_argument(
+        "--exit-on-stable-elf", action="store_true",
+        help="work around ModelSDK builds that do not return after writing a complete ELF",
+    )
 
     parser.add_argument("--no-simplify", action="store_true")
     parser.add_argument("--infer-shapes", action="store_true",
@@ -235,10 +349,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"[INFO] Outputs: {outputs}")
     print(f"[INFO] Output directory: {output}")
 
+    calibration_shapes = list(shapes)
+    original_shapes = dict(zip(names, shapes, strict=True))
     model_path = (
         args.model_path if args.no_simplify
         else prepare(args.model_path, names, shapes, infer_shapes=args.infer_shapes)
     )
+    if args.promote_rank3_hwc:
+        if args.external_dram_layout == "compiler":
+            raise SystemExit("--promote-rank3-hwc requires --external-dram-layout")
+        model_path = promote_rank3_hwc(model_path, args.model_layout)
+        names, shapes, outputs = detect_io(model_path)
 
     importer = ImporterParams(
         format=ModelFormat.onnx,
@@ -266,9 +387,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"[{'WARN' if 'drift' in note else 'INFO'}] {note}")
 
     samples = calib.build(
-        kind, source, names, shapes, layout=args.model_layout,
+        kind, source, names, calibration_shapes if args.promote_rank3_hwc else shapes,
+        layout=args.model_layout,
         types=dict(zip(names, type_names, strict=True)),
     )
+    if args.promote_rank3_hwc:
+        for sample in samples:
+            for name in names:
+                if len(original_shapes[name]) == 3:
+                    sample[name] = sample[name].reshape(
+                        sample[name].shape[0], 1, *sample[name].shape[1:]
+                    )
     print(f"[INFO] Calibration: {kind}, {len(samples)} sample(s)")
     config = (
         default_quantization
@@ -298,17 +427,66 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.no_compile:
         return 0
 
+    if args.exit_on_stable_elf:
+        if not args.retain_compile_dir:
+            raise SystemExit("--exit-on-stable-elf requires --retain-compile-dir")
+        _start_elf_watchdog(args.retain_compile_dir / f"{stem}_stage1_mla.elf")
+
+    if args.mla_tessellation and args.external_dram_layout != "compiler":
+        raise SystemExit("--mla-tessellation and --external-dram-layout are mutually exclusive")
+    compile_layout = (
+        tessellation_parameters(quantized) if args.mla_tessellation else
+        external_layout_parameters(quantized, args.external_dram_layout)
+        if args.external_dram_layout != "compiler" else None
+    )
     quantized.compile(
         output_path=str(output),
         batch_size=args.batch_size,
         log_level=logging.INFO,
-        tessellate_parameters=tessellation_parameters(quantized) if args.mla_tessellation else None,
+        tessellate_parameters=compile_layout,
         retained_temporary_directory_name=(
             str(args.retain_compile_dir) if args.retain_compile_dir else None
         ),
     )
     print("[INFO] Compilation complete")
     return 0
+
+
+def _start_elf_watchdog(path: Path, stable_seconds: float = 30.0) -> None:
+    """Exit successfully if ModelSDK hangs after finishing the retained ELF.
+
+    ModelSDK 2.1.0 can remain inside ``quantized.compile`` indefinitely for the
+    large native SmolVLA vision graph even after logging code-generation
+    completion and closing the 590 MiB ELF.  ELF presence is already PoLiMa's
+    compile success condition.  This opt-in watchdog additionally requires an
+    unchanged size and mtime for 30 seconds, so it cannot accept a file that is
+    still being streamed.
+    """
+    def watch() -> None:
+        previous: tuple[int, int] | None = None
+        stable_since: float | None = None
+        while True:
+            try:
+                stat = path.stat()
+                current = (stat.st_size, stat.st_mtime_ns)
+            except FileNotFoundError:
+                current = None
+            now = time.monotonic()
+            if current is not None and current == previous and current[0] > 0:
+                stable_since = stable_since or now
+                if now - stable_since >= stable_seconds:
+                    print(
+                        f"[INFO] ELF stable for {stable_seconds:.0f}s; "
+                        "leaving stuck ModelSDK post-generation cleanup",
+                        flush=True,
+                    )
+                    os._exit(0)
+            else:
+                previous = current
+                stable_since = now if current is not None else None
+            time.sleep(2.0)
+
+    threading.Thread(target=watch, name="polima-elf-watchdog", daemon=True).start()
 
 
 if __name__ == "__main__":

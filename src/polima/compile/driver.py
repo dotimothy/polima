@@ -25,6 +25,7 @@ recompiling a backbone that did not change. See docs/carry-forward.md.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import threading
 import time
@@ -138,7 +139,12 @@ class Driver:
             f"graph={graph.name}",
             f"layout={graph.layout}",
             f"precisions={','.join(graph.precisions)}",
+            f"activation_precision={graph.activation_precision or ''}",
+            f"weight_precision={graph.weight_precision or ''}",
             f"tessellation={int(graph.mla_tessellation)}",
+            f"exit_on_stable_elf={int(graph.exit_on_stable_elf)}",
+            f"external_dram_layout={graph.external_dram_layout}",
+            f"promote_rank3_hwc={int(graph.promote_rank3_hwc)}",
             f"compiler={graph.compiler}",
             f"llima_args={','.join(graph.llima_args)}",
             f"sdk={self.sdk_version}",
@@ -216,13 +222,27 @@ class Driver:
             "--precision", precision,
             "--model-layout", graph.layout,
         ]
+        if graph.activation_precision:
+            command += ["--activation-precision", graph.activation_precision]
+        if graph.weight_precision:
+            command += ["--weight-precision", graph.weight_precision]
         calibration = self.calibration_path(graph)
         if calibration is not None:
             flag = "--calibration-npz" if graph.calibration.kind == "npz" else "--calibration-raw-f32"
             command += [flag, str(calibration)]
         if graph.mla_tessellation:
-            command += ["--mla-tessellation", "--retain-compile-dir",
-                        str(self.retained_dir(graph.name))]
+            command += ["--mla-tessellation"]
+        # `elf_from=retained` is an output-selection contract, independent of
+        # tessellation.  Previously plain-HWC graphs did not receive a retained
+        # directory, so a successful compiler run could not be published.
+        if graph.elf_from == "retained" or graph.exit_on_stable_elf:
+            command += ["--retain-compile-dir", str(self.retained_dir(graph.name))]
+        if graph.exit_on_stable_elf:
+            command += ["--exit-on-stable-elf"]
+        if graph.external_dram_layout != "compiler":
+            command += ["--external-dram-layout", graph.external_dram_layout]
+        if graph.promote_rank3_hwc:
+            command += ["--promote-rank3-hwc"]
         command += list(graph.llima_args)
         return command
 
@@ -324,12 +344,29 @@ class Driver:
                            note=f"all precisions failed ({', '.join(graph.precisions)})")
 
     def run(self, only: Sequence[str] | None = None) -> list[GraphResult]:
+        started = time.monotonic()
         graphs = self.select(only)
+        cores = os.cpu_count()
+        # One independent compiler subprocess produces one ELF. More workers
+        # than ELFs have nothing to do, and more workers than logical CPUs only
+        # oversubscribe the host. Memory may require the caller to choose less.
+        workers = min(self.jobs, len(graphs), cores or self.jobs)
+        elf_label = f"{len(graphs)} ELF{'s' if len(graphs) != 1 else ''} to compile"
+        core_label = (
+            f"{cores} logical CPU core{'s' if cores != 1 else ''}"
+            if cores else "CPU count unknown"
+        )
+        print(
+            f"  workload  {elf_label}; {core_label}; {workers} parallel job"
+            f"{'s' if workers != 1 else ''}",
+            flush=True,
+        )
         results = (
-            self._run_sequential(graphs) if self.jobs <= 1 or len(graphs) == 1
-            else self._run_parallel(graphs)
+            self._run_sequential(graphs) if workers <= 1
+            else self._run_parallel(graphs, workers)
         )
         self.write_manifest(results)
+        print(f"\n  total compile time  {time.monotonic() - started:.1f}s", flush=True)
         return results
 
     def _run_sequential(self, graphs) -> list[GraphResult]:
@@ -345,7 +382,7 @@ class Driver:
                 break
         return results
 
-    def _run_parallel(self, graphs) -> list[GraphResult]:
+    def _run_parallel(self, graphs, workers: int) -> list[GraphResult]:
         """Compile independent graphs at once.
 
         Threads rather than processes: each compile is a subprocess, so the work
@@ -358,7 +395,6 @@ class Driver:
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        workers = min(self.jobs, len(graphs))
         print(f"  running {workers} graph(s) at a time", flush=True)
         by_name: dict[str, GraphResult] = {}
         with ThreadPoolExecutor(max_workers=workers) as pool:

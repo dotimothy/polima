@@ -1,0 +1,15 @@
+# Checkpoint-compatible host stack. These are the versions that produced the
+# verified SmolVLA ONNX chain; newer Torch/Transformers changed prefix packing.
+numpy==1.26.4
+protobuf==4.25.7
+packaging==25.0
+fsspec==2026.2.0
+torch==2.3.1+cpu
+torchvision==0.18.1+cpu
+transformers==4.57.1
+huggingface-hub==0.36.2
+av==18.0.0
+opencv-python-headless==4.11.0.86
+onnx==1.17.0
+onnxruntime==1.21.1
+onnxsim==0.4.36

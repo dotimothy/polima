@@ -95,17 +95,23 @@ def build_native(
 
 
 def _link_binaries(session: BoardSession, board: BoardConfig, build_dir: str) -> None:
-    """bin/<name> -> build/<hash>/<name>, so callers never learn the hash."""
+    """Atomically install the one active native binary pair under ``bin/``."""
     for name in BINARIES:
         session.run(
-            f"ln -sfn {shlex.quote(build_dir + '/' + name)} "
+            f"install -m 0755 {shlex.quote(build_dir + '/' + name)} "
+            f"{shlex.quote(board.path('bin', name + '.new'))} && "
+            f"mv -f {shlex.quote(board.path('bin', name + '.new'))} "
             f"{shlex.quote(board.path('bin', name))}"
         )
 
 
 #: Alias -> binary, installed onto PATH. Dashes match the console scripts
 #: (`polima-run`, `polima-doctor`); the binaries keep their underscored names.
-PATH_ALIASES = {"polima-server": "polima_server", "polima-cli": "polima_cli"}
+PATH_ALIASES = {
+    "polima": "polima_cli",
+    "polima-server": "polima_server",
+    "polima-cli": "polima_cli",
+}
 
 #: Where LLiMa lives on the SoM (`/usr/bin/llima`), so this is the convention
 #: the devkit already follows. /usr/local/bin is preferred because it is ahead
@@ -120,10 +126,9 @@ def link_onto_path(session: BoardSession, board: BoardConfig) -> dict[str, str]:
     PATH, so every invocation needs the full path. LLiMa installs `/usr/bin/llima`
     and is simply `llima` from any shell; matching that is the whole point.
 
-    The links point at `bin/<name>`, which is itself a symlink into the
-    content-hashed build tree. That indirection is deliberate: a rebuild moves
-    `bin/<name>` and the PATH alias follows automatically, so this never has to
-    run again.
+    The links point at the atomically installed pair under `bin/`. CMake's
+    content-addressed directories are build caches, not additional installed
+    runtimes; callers and PATH never depend on their names.
 
     Best-effort by design. A convenience alias must never fail a deploy, so a
     directory that needs root is tried with `sudo -n` and skipped if that would
@@ -131,7 +136,7 @@ def link_onto_path(session: BoardSession, board: BoardConfig) -> dict[str, str]:
     """
     linked: dict[str, str] = {}
     for directory in PATH_DIRS:
-        if not session.run(f"test -d {shlex.quote(directory)}", check=False).returncode == 0:
+        if session.run(f"test -d {shlex.quote(directory)}", check=False).returncode != 0:
             continue
         writable = session.run(f"test -w {shlex.quote(directory)}", check=False).returncode == 0
         prefix = "" if writable else "sudo -n "

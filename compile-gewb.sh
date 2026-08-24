@@ -5,13 +5,12 @@
 set -Eeuo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+POLIMA_ROOT="$ROOT/polima"
+POLIMA_OUTPUTS_ROOT="${POLIMA_OUTPUTS:-$POLIMA_ROOT/outputs}"
 CHECKPOINT="${CHECKPOINT:-$ROOT/ACT/outputs/gewb_2_final_act_20260806_195153/checkpoints/100000/pretrained_model}"
-BUILD_DIR="${BUILD_DIR:-$ROOT/ACT/outputs/polima_gewb_act_100000}"
+BUILD_DIR="${BUILD_DIR:-$POLIMA_OUTPUTS_ROOT/build/polima_gewb_act_100000}"
 
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate act
-
-exec "$ROOT/polima/bin/polima" compile \
+exec "$POLIMA_ROOT/bin/polima" compile \
     --checkpoint "$CHECKPOINT" \
     --build-dir "$BUILD_DIR" \
     "$@"

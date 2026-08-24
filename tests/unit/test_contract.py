@@ -36,7 +36,16 @@ def write_dataset(root, *, features=None, fps=30, episodes=10, frames=1000,
     }
     (root / "meta" / "info.json").write_text(json.dumps(info), encoding="utf-8")
     if with_tasks:
-        (root / "meta" / "tasks.parquet").touch()
+        tasks_path = root / "meta" / "tasks.parquet"
+        try:
+            import pyarrow as arrow
+            import pyarrow.parquet as parquet
+        except ImportError:
+            # PyArrow is optional for the base package; validation records that
+            # the task check was skipped when it is not installed.
+            tasks_path.touch()
+        else:
+            parquet.write_table(arrow.table({"task": ["pick up the red cube"]}), tasks_path)
     return root
 
 

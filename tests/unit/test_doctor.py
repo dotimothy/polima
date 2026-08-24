@@ -1,0 +1,130 @@
+"""`polima doctor` checks the platform it is on.
+
+Every landmine doctor was written for is a host landmine -- the MLSandbox
+checkout, the legacy lerobot clones, the SiMa compiler venv, /ml_datasets. A SoM
+has none of them, so before the platform gate a board install reported
+`fail=1 warn=8` that no board action could clear, and `polima-doctor` exited 1
+on a perfectly healthy board.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from polima import role
+from polima.cli import doctor
+from polima.util import table
+
+#: The sections that only make sense where the build happens.
+HOST_SECTIONS = ("check_repo", "check_lerobot_patches", "check_compiler", "check_datasets")
+#: Sections that run everywhere, so the board still gets a useful report.
+SHARED_SECTIONS = ("check_role", "check_host", "check_import_matrix", "check_policies")
+
+BOARD = role.Capabilities(
+    role=role.BOARD, machine="aarch64", can_compile=False,
+    can_deploy=False, can_run=True, can_robot=True, missing={},
+)
+HOST = role.Capabilities(
+    role=role.HOST, machine="x86_64", can_compile=True,
+    can_deploy=True, can_run=True, can_robot=False, missing={},
+)
+
+
+@pytest.fixture
+def ran(monkeypatch):
+    """Replace every section with a recorder, so no test shells out."""
+    called: list[str] = []
+
+    def recorder(name):
+        def section(*args, **kwargs):
+            called.append(name)
+        return section
+
+    for name in HOST_SECTIONS + SHARED_SECTIONS + ("check_board",):
+        monkeypatch.setattr(doctor, name, recorder(name))
+    return called
+
+
+def _as(monkeypatch, capabilities):
+    monkeypatch.setattr(role, "detect", lambda: capabilities)
+
+
+def test_board_skips_the_host_only_sections(ran, monkeypatch, capsys):
+    _as(monkeypatch, BOARD)
+    assert doctor.run([]) == 0
+    assert not [name for name in ran if name in HOST_SECTIONS]
+    for name in SHARED_SECTIONS:
+        assert name in ran, f"{name} must run on every platform"
+
+
+def test_board_says_what_it_skipped(ran, monkeypatch, capsys):
+    """A shorter report has to explain itself, or it reads as checks silently lost."""
+    _as(monkeypatch, BOARD)
+    doctor.run([])
+    output = capsys.readouterr().out
+    assert "host-only checks" in output
+    for section in doctor.HOST_ONLY_SECTIONS:
+        assert section in output
+    assert "--all" in output
+
+
+def test_all_overrides_the_platform_gate(ran, monkeypatch):
+    _as(monkeypatch, BOARD)
+    doctor.run(["--all"])
+    for name in HOST_SECTIONS:
+        assert name in ran
+
+
+def test_host_runs_everything(ran, monkeypatch):
+    _as(monkeypatch, HOST)
+    doctor.run([])
+    for name in HOST_SECTIONS + SHARED_SECTIONS:
+        assert name in ran
+
+
+def test_board_probes_itself_rather_than_ssh(monkeypatch):
+    """On the board, `board.host` is this machine; ssh'ing to it is a loopback
+    that needs a key the board has no reason to hold."""
+    argv_seen: list[list[str]] = []
+
+    class Result:
+        returncode = 0
+        stdout = "VER=aarch64\nCORES=16\nFREE=430\nCMAKE=3.25.1\n"
+        stderr = ""
+
+    def fake_run(argv, **kwargs):
+        argv_seen.append(argv)
+        return Result()
+
+    monkeypatch.setattr(doctor.subprocess, "run", fake_run)
+    from polima.config.loader import load
+
+    doc = doctor.Doctor(json_output=True)
+    doctor.check_board(doc, load(), local=True)
+    assert argv_seen[0][0] == "sh"
+
+    doctor.check_board(doc, load(), local=False)
+    assert argv_seen[1][0] == "ssh"
+
+
+def test_a_healthy_board_exits_zero(ran, monkeypatch):
+    """The regression this gate exists for: `polima-doctor` on a working SoM."""
+    _as(monkeypatch, BOARD)
+    assert doctor.run([]) == 0
+
+
+def test_explicit_board_flag_still_does_the_remote_probe(monkeypatch):
+    """`--board` is an explicit request, so the role must not override it."""
+    seen: list[bool] = []
+    monkeypatch.setattr(
+        doctor, "check_board", lambda doc, config, local=False: seen.append(local)
+    )
+    _as(monkeypatch, BOARD)
+    doctor.run(["--board"])
+    assert seen == [False]
+
+
+def test_skip_notice_is_not_a_failure(monkeypatch):
+    doc = doctor.Doctor(json_output=True)
+    doctor.skip_host_sections(doc, BOARD)
+    assert doc.worst == table.OK

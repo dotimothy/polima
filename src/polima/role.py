@@ -43,9 +43,9 @@ UNKNOWN = "unknown"
 #: Commands that only make sense on the machine that compiles.
 HOST_COMMANDS = ("compile", "deploy")
 #: Commands that run where the MLA and the arm are.
-BOARD_COMMANDS = ("run", "robot")
+BOARD_COMMANDS = ("run", "robot", "studio")
 #: Commands that work anywhere.
-SHARED_COMMANDS = ("doctor", "data", "list", "clean")
+SHARED_COMMANDS = ("help", "doctor", "data", "list", "clean")
 
 _CAPABILITY_MODULES = {
     "torch": "export (compile stage)",
@@ -94,6 +94,7 @@ class Capabilities:
             "deploy": self.can_deploy,
             "run": self.can_run,
             "robot": self.can_robot,
+            "studio": self.can_robot,
         }.get(command, True)
 
     def explain(self, command: str) -> str:
@@ -103,6 +104,7 @@ class Capabilities:
             "deploy": "ssh and rsync on PATH",
             "run": "numpy (always available) -- this should not fail",
             "robot": "flask + opencv + lerobot; install with polima[robot]",
+            "studio": "flask + waitress; install with polima[robot]",
         }
         return needs.get(command, "")
 
@@ -140,8 +142,8 @@ def detect() -> Capabilities:
 
     board = is_board()
     # Compiling does not need afe *here*: `polima compile` runs the compiler as a
-    # subprocess under its own venv, because that venv has afe but no torch and
-    # the training env has torch but no afe -- they can never be one interpreter.
+    # subprocess under its own provisioned extension, while the self-contained
+    # PoLiMa venv owns torch, LeRobot and the rest of the export stack.
     # So the real question is whether that venv is discoverable. Requiring an
     # in-process afe would refuse a compile that works. It is still accepted as
     # an alternative, since inside the SDK container afe *is* importable here.

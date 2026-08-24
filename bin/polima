@@ -10,15 +10,13 @@
 #   export PATH=/workspace/MLSandbox/polima/bin:$PATH
 #   polima compile --build-dir ...
 #
-# Interpreter choice: $POLIMA_PYTHON, then whatever `python3` resolves to --
-# which after `conda activate act` is that env, and in the SDK container is the
-# container's. Only if that lacks numpy does it fall back to the model
-# compiler's python.
+# Interpreter choice: an explicit $POLIMA_PYTHON wins, then PoLiMa's complete
+# project-local .venv. Conda environments are deliberately ignored: export
+# dependencies live in .venv and only the proprietary ModelSDK extension is
+# allowed to use another interpreter.
 #
-# The order matters and the obvious one is wrong. Preferring the compiler's
-# python looks safe (it always has numpy) but it has no torch, so
-# `compile --checkpoint` dies in the export stage with ModuleNotFoundError:
-# lerobot -- ignoring the environment the caller deliberately activated.
+# The compiler's python remains a last-resort launcher for provisioned SDK
+# containers that do not mount the host venv; it is never preferred on host.
 set -euo pipefail
 
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -27,6 +25,7 @@ export PYTHONPATH="$root/src${PYTHONPATH:+:$PYTHONPATH}"
 pick_python() {
     if [[ -n "${POLIMA_PYTHON:-}" ]]; then echo "$POLIMA_PYTHON"; return; fi
     local candidates=(
+        "$root/.venv/bin/python"
         "$(command -v python3 || true)"
         "${MODEL_COMPILER_BIN:-}/python"
         /sdk-extensions/model-compiler/bin/python

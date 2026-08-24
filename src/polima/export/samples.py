@@ -49,18 +49,44 @@ def load(policy, checkpoint: str | Path, observation_keys: Sequence[str],
     from lerobot.policies import make_pre_post_processors
 
     repo_id, root = resolve_dataset(checkpoint, dataset_root)
+    # A checkpoint may rename raw dataset features before the model sees them
+    # (the combined SmolVLA run maps overhead/wrist to camera1/camera2).  The
+    # graph module names processed tensors; dataset lookup must use the inverse
+    # map and then let the saved preprocessor perform the rename normally.
+    inverse_rename: dict[str, str] = {}
+    processor_manifest = Path(checkpoint) / "policy_preprocessor.json"
+    if processor_manifest.is_file():
+        manifest = json.loads(processor_manifest.read_text(encoding="utf-8"))
+        for step in manifest.get("steps", []):
+            if step.get("registry_name") == "rename_observations_processor":
+                rename = step.get("config", {}).get("rename_map") or {}
+                inverse_rename.update({target: source for source, target in rename.items()})
     dataset = LeRobotDataset(repo_id=repo_id, root=str(root))
     preprocessor, postprocessor = make_pre_post_processors(
-        policy.config, pretrained_path=str(checkpoint)
+        policy.config,
+        pretrained_path=str(checkpoint),
+        preprocessor_overrides={"device_processor": {"device": "cpu"}},
+        postprocessor_overrides={"device_processor": {"device": "cpu"}},
     )
 
     indices = np.linspace(0, len(dataset) - 1, num=min(count, len(dataset)), dtype=int)
     samples = []
     for index in indices:
         item = dataset[int(index)]
-        observation = {key: item[key] for key in observation_keys}
+        observation = {
+            inverse_rename.get(key, key): item[inverse_rename.get(key, key)]
+            for key in observation_keys
+        }
         processed = preprocessor(observation)
+        # Language-conditioned preprocessors replace the string ``task`` with
+        # generated token and attention-mask tensors. Preserve every tensor the
+        # processor emits rather than projecting back down to the raw keys;
+        # ACT sees the same state/images as before, while SmolVLA also receives
+        # ``observation.language.{tokens,attention_mask}``.
         samples.append({
-            key: processed[key].detach().cpu().float() for key in observation
+            key: value.detach().cpu().float() if value.is_floating_point()
+            else value.detach().cpu()
+            for key, value in processed.items()
+            if hasattr(value, "detach")
         })
     return samples, postprocessor, root

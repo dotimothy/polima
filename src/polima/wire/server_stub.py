@@ -96,14 +96,18 @@ class StubPlan:
                 raise PlanError("step names no source buffer")
             return state[name]
 
-        if op == "run_elf":
+        if op in ("run_elf", "run_elf_chain"):
             if graph_fn is None:
-                raise PlanError(f"no graph_fn supplied for {args['graph']!r}")
+                label = args.get("graph") or args.get("graphs")
+                raise PlanError(f"no graph_fn supplied for {label!r}")
             joined = np.concatenate([state[n] for n in args["in"]])
-            produced = np.asarray(graph_fn(args["graph"], joined), dtype=np.float32).reshape(-1)
+            produced = joined
+            graphs = [args["graph"]] if op == "run_elf" else args["graphs"]
+            for graph in graphs:
+                produced = np.asarray(graph_fn(graph, produced), dtype=np.float32).reshape(-1)
             if produced.size != out.size:
                 raise PlanError(
-                    f"graph {args['graph']!r} produced {produced.size} elements, "
+                    f"graph {graphs[-1]!r} produced {produced.size} elements, "
                     f"buffer holds {out.size}"
                 )
             state[step["out"]] = produced
@@ -140,6 +144,23 @@ class StubPlan:
                 write_at = index * dst_stride + dst_offset
                 target[write_at:write_at + take] = values[read_at:read_at + take]
             state[step["out"]] = target
+
+        elif op == "pixel_unshuffle":
+            # Eagle's channel fold, between the vision chain and the connector:
+            # a grid x grid map of C channels becomes (grid/f)^2 tokens of C*f^2.
+            # Written as the composition torch.pixel_unshuffle performs, because
+            # the equivalent index arithmetic is easy to transpose by accident
+            # and a transposed fold still produces finite, wrong features.
+            grid, channels, factor = args["grid"], args["channels"], args["factor"]
+            folded = source().reshape(grid, grid, channels)
+            folded = folded.reshape(
+                grid // factor, factor, grid // factor, factor, channels
+            )
+            # (row, col, dy, dx, c) -> flatten the trailing three into C*f^2,
+            # matching pixel_unshuffle's (c*f^2 + dy*f + dx) channel order.
+            folded = folded.transpose(0, 2, 1, 3, 4)
+            folded = folded.transpose(0, 1, 4, 2, 3)
+            state[step["out"]] = folded.reshape(-1).astype(np.float32)
 
         elif op == "scale":
             state[step["out"]] = source() * np.float32(args["scalar"])

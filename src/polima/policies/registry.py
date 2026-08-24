@@ -55,8 +55,8 @@ def registered() -> list[str]:
 
 def available() -> list[str]:
     """Every policy that could be loaded -- built-ins plus anything already
-    registered. Built-ins not yet ported (smolvla, groot in Phase 1) are listed
-    but will raise a clear error when actually requested."""
+    registered. A built-in whose module cannot import in this interpreter is
+    still listed, but will raise a clear error when actually requested."""
     return sorted(set(BUILTIN) | set(_REGISTRY))
 
 

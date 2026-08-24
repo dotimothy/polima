@@ -24,8 +24,8 @@ requires-python = ">=3.10"
 # Both halves share one core -- polima.policies, polima.wire, polima.bundle,
 # polima.config, polima.util -- because that core IS the contract between them:
 # the host writes bundle.json + plan.json, the board reads them. So the core must
-# import with stdlib + numpy alone, in all three interpreters (the `act` conda
-# env, the model-compiler venv which has afe but no torch, and the board's
+# import with stdlib + numpy alone, in all three interpreters (PoLiMa's host
+# venv, the model-compiler venv which has afe but no torch, and the board's
 # py3.11). Heavy imports happen lazily inside functions.
 #
 # `polima doctor --imports` proves this by importing the core in each
@@ -34,12 +34,16 @@ dependencies = ["numpy"]
 
 [project.optional-dependencies]
 # Host-side stages.
-export  = ["torch", "safetensors", "pyarrow", "draccus", "pyyaml"]
+export  = [
+    "torch", "safetensors", "pyarrow", "draccus", "pyyaml",
+    "datasets", "pandas", "av", "jsonlines",
+]
 compile = ["onnx", "onnxsim", "onnxruntime", "pyyaml"]
 deploy  = ["pyyaml"]
-host    = ["polima[export,compile,deploy]"]
+data    = ["pyarrow"]
+host    = ["polima[data,export,compile,deploy]"]
 # Board-side. Deliberately excludes torch/afe: the board never compiles.
-robot   = ["flask", "opencv-python-headless"]
+robot   = ["flask", "waitress", "opencv-python-headless"]
 board   = ["polima[robot]"]
 dev     = ["pytest", "ruff"]
 
@@ -52,6 +56,7 @@ polima-deploy = "polima.cli.entry:deploy"
 # Board stages -- mirrors llima-run.
 polima-run = "polima.cli.entry:run_"
 polima-robot = "polima.cli.entry:robot"
+polima-studio = "polima.cli.entry:studio"
 # Works on both; the first thing to run after any install.
 polima-doctor = "polima.cli.entry:doctor"
 
@@ -59,7 +64,7 @@ polima-doctor = "polima.cli.entry:doctor"
 where = ["src"]
 
 [tool.setuptools.package-data]
-polima = ["robot/templates/*.html", "patches/*.patch"]
+polima = ["robot/templates/*.html", "patches/*.patch", "studio/static/*.html", "studio/static/assets/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests/unit"]

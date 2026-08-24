@@ -75,7 +75,6 @@ def export(spec, checkpoint: str | Path, build_dir: str | Path, *,
     import torch
 
     from polima.export import samples as sampling
-    from polima.export.normalization import write as write_normalization
 
     random.seed(seed)
     np.random.seed(seed)
@@ -90,12 +89,21 @@ def export(spec, checkpoint: str | Path, build_dir: str | Path, *,
     policy, image_keys = graphs_module.load_policy(checkpoint, lerobot_src=lerobot_src)
     modules = graphs_module.build_modules(policy)
 
-    observation_keys = [spec.dataset.state_key, *image_keys]
-    drawn, postprocessor, resolved_root = sampling.load(
+    observation_keys = [
+        spec.dataset.state_key,
+        *image_keys,
+        *getattr(graphs_module, "EXTRA_OBSERVATION_KEYS", ()),
+    ]
+    # A policy whose checkpoint is not a LeRobot policy supplies its own draw.
+    # GR00T's is a transformers AutoModel over a LeRobot v2.1 dataset, so the
+    # shared path's `make_pre_post_processors` has nothing to build from.
+    draw = getattr(graphs_module, "load_samples", sampling.load)
+    drawn, postprocessor, resolved_root = draw(
         policy, checkpoint, observation_keys, dataset_root,
         count=calibration_samples, lerobot_src=lerobot_src,
     )
-    traces = [graphs_module.trace(modules, sample, image_keys) for sample in drawn]
+    trace_samples = drawn[:1] if getattr(graphs_module, "TRACE_FIRST_ONLY", False) else drawn
+    traces = [graphs_module.trace(modules, sample, image_keys) for sample in trace_samples]
 
     written = resolve(spec.compile.export_entry)(
         build_dir, modules, drawn, traces, image_keys
@@ -105,7 +113,9 @@ def export(spec, checkpoint: str | Path, build_dir: str | Path, *,
             build_dir, drawn[0], traces[0], image_keys, postprocessor
         )
     if spec.compile.normalization_entry:
-        write_normalization(checkpoint, image_keys, build_dir / "normalization_stats.npz")
+        resolve(spec.compile.normalization_entry)(
+            checkpoint, image_keys, build_dir / "normalization_stats.npz"
+        )
 
     _write_contract(spec, build_dir, checkpoint, resolved_root, image_keys, written)
 

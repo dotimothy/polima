@@ -28,6 +28,14 @@ from polima.policies.act.runtime import (
     CAMERA_ELEMENTS,
     STEM_ELEMENTS,
 )
+from polima.policies.base import (
+    CompilePlan,
+    GraphSpec,
+    RuntimePlan,
+    SpecError,
+    Step,
+    TensorSpec,
+)
 from polima.wire.server_stub import PlanError, StubPlan, golden_graph_fn
 
 BUNDLES = Path(__file__).resolve().parents[2] / "outputs" / "bundles"
@@ -93,6 +101,52 @@ def test_gather_strided_unpads_16_to_6():
     padded[:, :6] = np.arange(600, dtype=np.float32).reshape(100, 6)
     gathered = padded.reshape(-1)[: 100 * 16].reshape(100, 16)[:, :6].reshape(-1)
     np.testing.assert_array_equal(gathered, np.arange(600, dtype=np.float32))
+
+
+def _shared_graph(name: str, elements: int = 12, *, layout: str = "HWC") -> GraphSpec:
+    return GraphSpec(
+        name=name,
+        builder="tests.fake:Graph",
+        inputs=(TensorSpec("x", (1, 3, elements // 3)),),
+        outputs=(TensorSpec("y", (1, 3, elements // 3)),),
+        layout="NHWC",
+        mla_tessellation=False,
+        external_dram_layout=layout,
+        promote_rank3_hwc=True,
+    )
+
+
+def test_stub_executes_a_shared_chain_as_sequential_graphs():
+    plan = StubPlan(
+        buffers={"x": 4, "y": 4},
+        steps=[{
+            "op": "run_elf_chain", "out": "y",
+            "args": {"graphs": ["add_one", "times_two"], "in": ["x"]},
+        }],
+        result="y",
+    )
+
+    def graph_fn(name, values):
+        return values + 1 if name == "add_one" else values * 2
+
+    np.testing.assert_array_equal(
+        plan.run({"x": np.arange(4, dtype=np.float32)}, graph_fn=graph_fn),
+        np.array([2, 4, 6, 8], dtype=np.float32),
+    )
+
+
+def test_shared_chain_requires_explicit_hwc_graphs():
+    compile_plan = CompilePlan(
+        graphs=(_shared_graph("a"), _shared_graph("b", layout="compiler")),
+        export_entry="tests.fake:export",
+    )
+    plan = RuntimePlan(
+        buffers={"x": 12, "y": 12},
+        steps=(Step("run_elf_chain", "y", {"graphs": ["a", "b"], "in": ["x"]}),),
+        result="y",
+    )
+    with pytest.raises(SpecError, match="external_dram_layout='HWC'"):
+        plan.validate("test", compile_plan)
 
 
 def test_pack_zeroes_the_latent_token(tmp_path):

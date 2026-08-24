@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import tarfile
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -20,9 +21,12 @@ import pytest
 from polima.compile import calibration as calib
 from polima.compile import mpk
 from polima.compile.driver import Driver, GraphResult
-from polima.compile.tensor import build_parser
+from polima.compile.tensor import (
+    build_parser,
+    detect_io,
+    promote_rank3_hwc,
+)
 from polima.policies.registry import get_policy
-
 
 # --------------------------------------------------------------- calibration
 
@@ -255,6 +259,86 @@ def test_encoder_layers_compile_as_nhwc(tmp_path):
         assert argv[argv.index("--model-layout") + 1] == "NHWC"
 
 
+def test_shared_graph_argv_requests_rank4_hwc_boundaries(tmp_path):
+    driver = _driver(tmp_path)
+    graph = replace(
+        get_policy("act").compile.graph("encoder_layer_01"),
+        inputs=(replace(
+            get_policy("act").compile.graph("encoder_layer_01").inputs[0],
+            shape=(1, 602, 512),
+        ),),
+        outputs=(replace(
+            get_policy("act").compile.graph("encoder_layer_01").outputs[0],
+            shape=(1, 602, 512),
+        ),),
+        mla_tessellation=False,
+        external_dram_layout="HWC",
+        promote_rank3_hwc=True,
+    )
+    argv = driver.argv(graph, "bf16")
+    assert argv[argv.index("--external-dram-layout") + 1] == "HWC"
+    assert "--promote-rank3-hwc" in argv
+    assert "--mla-tessellation" not in argv
+
+
+def test_smolvla_vision_keeps_plain_model_io(tmp_path):
+    driver = Driver(
+        spec=get_policy("smolvla"), build_dir=tmp_path,
+        compiler_python="/nonexistent/python",
+    )
+    argv = driver.argv(get_policy("smolvla").compile.graph("vision"), "bf16")
+    assert "--mla-tessellation" not in argv
+    assert "--retain-compile-dir" in argv
+    assert "--exit-on-stable-elf" in argv
+    assert "--no-simplify" in argv
+
+
+def test_smolvla_denoise_uses_calibrated_split_precision(tmp_path):
+    driver = Driver(
+        spec=get_policy("smolvla"), build_dir=tmp_path,
+        compiler_python="/nonexistent/python",
+    )
+    graph = get_policy("smolvla").compile.graph("denoise")
+    argv = driver.argv(graph, "bf16")
+    assert argv[argv.index("--activation-precision") + 1] == "bf16"
+    assert argv[argv.index("--weight-precision") + 1] == "int8"
+    assert argv[argv.index("--calibration-raw-f32") + 1].endswith(
+        "calibration/denoise.f32"
+    )
+
+
+def test_smolvla_prefix_uses_plain_bf16_hwc_boundaries(tmp_path):
+    driver = Driver(
+        spec=get_policy("smolvla"), build_dir=tmp_path,
+        compiler_python="/nonexistent/python",
+    )
+    graph = get_policy("smolvla").compile.graph("prefix")
+    argv = driver.argv(graph, graph.precision)
+    assert "--activation-precision" not in argv
+    assert "--weight-precision" not in argv
+    assert "--mla-tessellation" not in argv
+    assert argv[argv.index("--external-dram-layout") + 1] == "HWC"
+    assert argv[argv.index("--retain-compile-dir") + 1].endswith("retained/prefix")
+    assert "--exit-on-stable-elf" in argv
+
+
+def test_smolvla_vision_uses_plain_bf16_hwc_boundaries(tmp_path):
+    driver = Driver(
+        spec=get_policy("smolvla"), build_dir=tmp_path,
+        compiler_python="/nonexistent/python",
+    )
+    graph = get_policy("smolvla").compile.graph("vision")
+    argv = driver.argv(graph, graph.precision)
+    assert argv[argv.index("--precision") + 1] == "bf16"
+    assert "--activation-precision" not in argv
+    assert "--weight-precision" not in argv
+    assert argv[argv.index("--external-dram-layout") + 1] == "HWC"
+    assert "--promote-rank3-hwc" in argv
+    assert "--calibration-raw-f32" not in argv
+    assert argv[argv.index("--retain-compile-dir") + 1].endswith("retained/vision")
+    assert "--exit-on-stable-elf" in argv
+
+
 def test_stage_key_is_stable_for_unchanged_inputs(tmp_path):
     driver = _driver(tmp_path)
     graph = get_policy("act").compile.graph("encoder_layer_01")
@@ -386,6 +470,71 @@ def test_tensor_cli_accepts_the_smolvla_surface():
     ])
     assert args.device == "mlsoc" and args.no_compile and args.infer_shapes
     assert args.activation_precision == "bf16" and args.weight_precision == "int8"
+
+
+def test_rank3_hwc_promotion_preserves_names_and_element_counts(tmp_path):
+    onnx = pytest.importorskip("onnx")
+    x = onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [1, 7, 16])
+    y = onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [1, 7, 16])
+    graph = onnx.helper.make_graph(
+        [onnx.helper.make_node("Identity", ["x"], ["y"])], "rank3", [x], [y]
+    )
+    source = tmp_path / "stage.onnx"
+    onnx.save(onnx.helper.make_model(graph), source)
+
+    promoted = promote_rank3_hwc(source)
+
+    names, shapes, outputs = detect_io(promoted)
+    assert names == ["x"] and outputs == ["y"]
+    assert shapes == [(1, 1, 7, 16)]
+    model = onnx.load(promoted)
+    assert [node.op_type for node in model.graph.node] == ["Reshape", "Identity", "Reshape"]
+
+
+def test_rank3_hwc_promotion_can_wrap_only_the_output(tmp_path):
+    onnx = pytest.importorskip("onnx")
+    x = onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [1, 3, 8, 8])
+    y = onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [1, 64, 3])
+    reshape_shape = onnx.helper.make_tensor(
+        "shape", onnx.TensorProto.INT64, [3], [1, 64, 3]
+    )
+    graph = onnx.helper.make_graph(
+        [onnx.helper.make_node("Reshape", ["x", "shape"], ["y"])],
+        "rank4_to_rank3", [x], [y], [reshape_shape],
+    )
+    source = tmp_path / "vision.onnx"
+    onnx.save(onnx.helper.make_model(graph), source)
+
+    promoted = promote_rank3_hwc(source)
+
+    names, shapes, outputs = detect_io(promoted)
+    assert names == ["x"] and shapes == [(1, 3, 8, 8)] and outputs == ["y"]
+    model = onnx.load(promoted)
+    output_shape = [
+        dim.dim_value for dim in model.graph.output[0].type.tensor_type.shape.dim
+    ]
+    assert output_shape == [1, 1, 64, 3]
+
+
+def test_rank3_hwc_promotion_uses_nchw_axes_when_requested(tmp_path):
+    onnx = pytest.importorskip("onnx")
+    x = onnx.helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [1, 3, 8, 8])
+    y = onnx.helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [1, 64, 960])
+    shape = onnx.helper.make_tensor("shape", onnx.TensorProto.INT64, [3], [1, 64, 960])
+    graph = onnx.helper.make_graph(
+        [onnx.helper.make_node("Reshape", ["x", "shape"], ["y"])],
+        "vision", [x], [y], [shape],
+    )
+    source = tmp_path / "vision.onnx"
+    onnx.save(onnx.helper.make_model(graph), source)
+
+    promoted = promote_rank3_hwc(source, "NCHW")
+
+    model = onnx.load(promoted)
+    output_shape = [
+        dim.dim_value for dim in model.graph.output[0].type.tensor_type.shape.dim
+    ]
+    assert output_shape == [1, 960, 1, 64]
 
 
 def test_tensor_module_imports_without_afe():
@@ -635,6 +784,43 @@ def test_parallel_reports_in_plan_order(tmp_path):
         _write_inputs(driver, graph)
     results = driver.run()
     assert [r.name for r in results] == [g.name for g in graphs]
+
+
+def test_compile_reports_elf_core_and_effective_job_counts(
+    tmp_path, monkeypatch, capsys,
+):
+    from polima.compile import driver as driver_module
+
+    driver = _driver(tmp_path, jobs=99, dry_run=True)
+    graphs = get_policy("act").compile.graphs
+    for graph in graphs:
+        _write_inputs(driver, graph)
+    monkeypatch.setattr(driver_module.os, "cpu_count", lambda: 20)
+
+    driver.run()
+
+    output = capsys.readouterr().out
+    assert f"{len(graphs)} ELFs to compile" in output
+    assert "20 logical CPU cores" in output
+    assert f"{len(graphs)} parallel jobs" in output
+    assert "total compile time" in output
+
+
+def test_effective_jobs_are_also_capped_by_logical_cores(
+    tmp_path, monkeypatch, capsys,
+):
+    from polima.compile import driver as driver_module
+
+    driver = _driver(tmp_path, jobs=99, dry_run=True)
+    for graph in get_policy("act").compile.graphs:
+        _write_inputs(driver, graph)
+    monkeypatch.setattr(driver_module.os, "cpu_count", lambda: 2)
+
+    driver.run()
+
+    output = capsys.readouterr().out
+    assert "2 parallel jobs" in output
+    assert "running 2 graph(s) at a time" in output
 
 
 def test_state_writes_are_serialized(tmp_path):

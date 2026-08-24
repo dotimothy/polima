@@ -6,6 +6,7 @@ __pycache__/
 .ruff_cache/
 build/
 dist/
+.venv/
 
 # PoLiMa outputs -- bundles, ONNX, ELFs and checkpoints are content-addressed
 # build products, never source.
@@ -19,3 +20,7 @@ outputs/
 # Local site config (board address etc.); .polima.yaml.example is tracked.
 .polima.yaml
 .polima.json
+
+# PoLiMa Studio host-side frontend dependencies; production assets are built
+# into src/polima/studio/static and shipped in the board wheel.
+studio-ui/node_modules/

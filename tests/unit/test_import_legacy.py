@@ -21,7 +21,18 @@ import json
 import pytest
 
 from polima.bundle import retained
-from polima.bundle.import_legacy import _declared_graphs, detect, resolve_elfs
+from polima.bundle.import_legacy import (
+    _declared_graphs,
+    LegacyBuild,
+    collect_fixtures,
+    collect_robot_files,
+    collect_sidecars,
+    detect,
+    hydrate_robot_client,
+    hydrate_runtime_metadata,
+    resolve_elfs,
+)
+from polima.bundle.layout import Bundle, GraphArtifact
 from polima.policies.act import ACT_SPEC
 
 GRAPHS = list(ACT_SPEC.compile.names)
@@ -153,6 +164,53 @@ def test_detect_missing_directory(tmp_path):
         detect(tmp_path / "absent")
 
 
+def test_smolvla_npz_becomes_wire_fixtures(tmp_path):
+    import numpy as np
+
+    from polima.policies.smolvla import SMOLVLA_SPEC
+
+    arrays = {
+        tensor.name: np.arange(tensor.elements, dtype=np.float32).reshape(tensor.shape)
+        for tensor in SMOLVLA_SPEC.wire.request_tensors
+    }
+    # Export fixtures store the vision graph input as NCHW even though the
+    # live wire protocol sends HWC.
+    for name in ("image0", "image1"):
+        arrays[name] = arrays[name].transpose(2, 0, 1)[None]
+    arrays["normalized_action"] = np.arange(
+        SMOLVLA_SPEC.wire.response_elements, dtype=np.float32
+    ).reshape(SMOLVLA_SPEC.wire.response_shape)
+    arrays["action"] = arrays["normalized_action"] + 1000
+    np.savez(tmp_path / SMOLVLA_SPEC.compile.fixture_file, **arrays)
+    np.savez(
+        tmp_path / "normalization_stats.npz",
+        state_mean=np.arange(6, dtype=np.float32) + 10,
+        state_std=np.arange(6, dtype=np.float32) + 1,
+        action_mean=np.zeros(6, dtype=np.float32),
+        action_std=np.ones(6, dtype=np.float32),
+    )
+
+    fixtures = collect_fixtures(
+        LegacyBuild(tmp_path, "polima-export-v1"), SMOLVLA_SPEC
+    )
+
+    for tensor in SMOLVLA_SPEC.wire.request_tensors:
+        path = fixtures[f"inputs/{tensor.name}.f32"]
+        actual = np.fromfile(path, dtype="<f4")
+        assert actual.size == tensor.elements
+        if tensor.name.startswith("image"):
+            expected_image = arrays[tensor.name][0].transpose(1, 2, 0).reshape(-1)
+            np.testing.assert_array_equal(actual, expected_image)
+        elif tensor.name == "state":
+            np.testing.assert_array_equal(
+                actual, arrays["state"] * np.arange(1, 7) + np.arange(10, 16)
+            )
+    expected = fixtures["expected/normalized_actions.f32"]
+    np.testing.assert_array_equal(
+        np.fromfile(expected, dtype="<f4"), arrays["action"].reshape(-1)
+    )
+
+
 # --------------------------------------------- adopting hand-built trees
 
 
@@ -222,3 +280,86 @@ def test_smolvla_declares_its_legacy_names():
     aliases = {g.name: g.legacy_names for g in get_policy("smolvla").compile.graphs}
     assert "vision_llima_bf16" in aliases["vision"]
     assert "denoise_single_bf16" in aliases["denoise"]
+
+
+def test_smolvla_legacy_constants_become_named_runtime_sidecars(tmp_path):
+    import numpy as np
+
+    from polima.bundle.import_legacy import LegacyBuild
+    from polima.policies.registry import get_policy
+
+    constants = tmp_path / "constants"
+    constants.mkdir()
+    direct = (
+        "empty_image_embedding",
+        "language_embedding",
+        "state_project_weight",
+        "state_project_bias",
+    )
+    for name in direct:
+        (constants / f"{name}.f32").write_bytes(name.encode())
+    np.arange(24, dtype="<f4").tofile(constants / "normalization_stats.f32")
+
+    sidecars = collect_sidecars(LegacyBuild(tmp_path, "unlabelled"), get_policy("smolvla"))
+
+    assert set(sidecars) == {
+        *direct, "state_mean", "state_std", "action_mean", "action_std",
+    }
+    assert np.fromfile(sidecars["state_mean"], dtype="<f4").tolist() == list(range(6))
+    assert np.fromfile(sidecars["action_std"], dtype="<f4").tolist() == list(range(18, 24))
+
+
+@pytest.mark.parametrize(
+    ("policy", "transport"),
+    [("act", "scripts/act_som_client.py"), ("smolvla", "scripts/smolvla_som_client.py")],
+)
+def test_robot_client_assets_are_complete(policy, transport):
+    from polima.policies.registry import get_policy
+
+    files = collect_robot_files(get_policy(policy))
+    assert {
+        "start.sh", "preview_robot_cameras.py",
+        "run_robot_client_with_live_view.py", transport,
+    } <= set(files)
+    assert all(path.is_file() for path in files.values())
+
+
+def test_old_bundle_is_hydrated_for_device_robot_control(tmp_path):
+    bundle = Bundle(root=tmp_path, policy="act", bundle_id="act-test")
+    (tmp_path / "fixtures").mkdir()
+    (tmp_path / "fixtures/normalization_stats.npz").write_bytes(b"stats")
+
+    assert hydrate_robot_client(bundle, ACT_SPEC)
+    assert (tmp_path / "robot_client/start.sh").is_file()
+    assert (tmp_path / "robot_client/preview_robot_cameras.py").is_file()
+    assert (tmp_path / "robot_client/scripts/act_som_client.py").is_file()
+    assert (tmp_path / "normalization_stats.npz").read_bytes() == b"stats"
+    manifest = json.loads((tmp_path / "bundle.json").read_text())
+    assert "robot_client/start.sh" in manifest["sidecars"]
+    assert not hydrate_robot_client(bundle, ACT_SPEC)
+
+
+def test_old_smolvla_bundle_is_hydrated_with_declared_output_layouts(tmp_path):
+    from polima.policies.registry import get_policy
+
+    bundle = Bundle(
+        root=tmp_path,
+        policy="smolvla",
+        bundle_id="smolvla-test",
+        graphs=[
+            GraphArtifact(name, f"models/{name}/share/{name}_stage1_mla.elf", "a" * 64, 1)
+            for name in ("vision", "prefix", "suffix", "denoise")
+        ],
+    )
+
+    assert hydrate_runtime_metadata(bundle, get_policy("smolvla"))
+    assert bundle.graph("prefix").dram_layout == "plain"
+    assert bundle.graph("prefix").external_dram_layout == "HWC"
+    assert bundle.graph("denoise").dram_layout == "hwc16"
+    assert bundle.graph("denoise").logical_width == 50
+    assert bundle.graph("denoise").logical_channels == 32
+    assert bundle.graph("vision").dram_layout == "plain"
+    assert not hydrate_runtime_metadata(bundle, get_policy("smolvla"))
+
+    restored = Bundle.from_dict(json.loads((tmp_path / "bundle.json").read_text()), tmp_path)
+    assert restored.graph("denoise").logical_channels == 32

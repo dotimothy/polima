@@ -20,6 +20,14 @@ A compile recompiles. The per-graph content key still exists and is still
 recorded, but skipping on it is opt-in via `--reuse` -- "it said reused and I
 wanted a build" is a worse failure than spending the nine minutes, especially
 when the export step re-runs either way and makes it look like work happened.
+
+Run with NO arguments at a terminal, it opens an interactive session instead of
+printing the flags to read: the checkpoints and build trees are on disk, so it
+finds them and offers them (see polima.cli.wizard). The session only composes a
+command line -- it prints the exact `polima compile ...` it is about to run and
+asks first -- so there is still one code path, and using it teaches the flags.
+Piped or scripted invocations are untouched: no TTY means the old message and
+exit 2.
 """
 
 from __future__ import annotations
@@ -28,6 +36,7 @@ import argparse
 import sys
 from pathlib import Path
 
+from polima.cli import wizard
 from polima.config.loader import load
 from polima.policies.registry import get_policy
 from polima.util import table
@@ -44,10 +53,21 @@ def needs_capability(argv: list[str]) -> str | None:
     """
     if any(a == "--import-legacy" or a.startswith("--import-legacy=") for a in argv):
         return None
+    # A bare call opens the interactive session, which offers packing (no
+    # compiler needed) alongside the compile paths and reports the gap itself.
+    # Gating it here would exit 3 before it could say any of that.
+    if not argv:
+        return None
     return "compile"
 
 
 def run(argv: list[str], parent: argparse.Namespace | None = None) -> int:
+    if wizard.bare_invocation_is_interactive(argv):
+        composed = _session(parent)
+        if composed is None:
+            return 130
+        argv = composed
+
     parser = argparse.ArgumentParser(prog="polima-compile")
     parser.add_argument("--policy", default="act")
     parser.add_argument(
@@ -110,6 +130,33 @@ def run(argv: list[str], parent: argparse.Namespace | None = None) -> int:
         return 2
 
     return _import_legacy(args, output_root)
+
+
+def _session(parent: argparse.Namespace | None) -> list[str] | None:
+    """Compose an argv interactively, then fall through to the normal parse.
+
+    Returns None when the user cancels, which `run` reports as 130 -- the shell
+    convention for an interrupted command, so a cancelled session is
+    distinguishable from a failed compile.
+    """
+    from polima import role
+    from polima.policies.registry import load_all
+
+    # load_all, not available(): the latter lists built-ins whose module may not
+    # import here, and offering one only to raise on get_policy is worse than
+    # not offering it.
+    specs = load_all(strict=False)
+    if not specs:
+        print("polima-compile: no policy is loadable here", file=sys.stderr)
+        return None
+    try:
+        return wizard.compose(specs, can_compile=role.detect().can_compile)
+    except wizard.Cancelled:
+        print("\n  cancelled")
+        return None
+    except KeyboardInterrupt:
+        print("\n  cancelled")
+        return None
 
 
 # ------------------------------------------------------------------- compile
@@ -206,11 +253,10 @@ def _compile(args, config, output_root: Path, dry_run: bool) -> int:
 
 
 def _export(args, spec, build_dir: Path, dry_run: bool) -> int:
-    """Checkpoint -> onnx/ + calibration/ + fixtures, under the training env.
+    """Checkpoint -> onnx/ + calibration/ + fixtures, under PoLiMa's venv.
 
-    Needs torch and lerobot, which the compiler venv does not have -- so unlike
-    the compile stage this runs in-process, and fails with a clear message rather
-    than an ImportError if it is invoked from the wrong interpreter.
+    Torch, LeRobot and ONNX belong to PoLiMa's dedicated host venv. AFE remains
+    the sole external extension and is subprocessed by the compile stage.
     """
     if dry_run:
         print(f"  [dry-run] export {args.checkpoint} -> {build_dir}")
@@ -220,17 +266,30 @@ def _export(args, spec, build_dir: Path, dry_run: bool) -> int:
         from polima.export.driver import export
     except ImportError as error:      # pragma: no cover - environment dependent
         print(f"polima-compile: export needs torch + lerobot ({error}).\n"
-              "  Run under the `act` conda env, or compile a build tree that "
-              "already has onnx/ with --build-dir alone.", file=sys.stderr)
+              "  Rebuild the self-contained environment with `make venv`,\n"
+              "  or compile an already-exported tree with --build-dir alone.",
+              file=sys.stderr)
         return 2
 
     print(table.section(f"export {spec.name} from {Path(args.checkpoint).name}"))
-    result = export(
-        spec, args.checkpoint, build_dir,
-        dataset_root=args.dataset_root,
-        calibration_samples=args.calibration_samples,
-        verify=not args.skip_verify,
-    )
+    try:
+        result = export(
+            spec, args.checkpoint, build_dir,
+            dataset_root=args.dataset_root,
+            calibration_samples=args.calibration_samples,
+            verify=not args.skip_verify,
+        )
+    except ModuleNotFoundError as error:   # pragma: no cover - environment dependent
+        # The guard above only covers importing the driver. torch and lerobot
+        # are reached later, inside the policy's own graph module, so without
+        # this the wrong environment produced a bare traceback -- easy to hit now
+        # that a bare `polima compile` offers checkpoints.
+        print(f"\npolima-compile: export needs {error.name}, which this "
+              f"interpreter does not have.\n"
+              "  Rebuild the self-contained environment with `make venv`,\n"
+              "  or compile an already-exported tree with --build-dir alone.",
+              file=sys.stderr)
+        return 2
     print(f"  {len(result.graphs)} graph(s), {result.calibration_samples} "
           f"calibration sample(s), {result.duration_s:.0f}s")
     print(f"  dataset   {result.dataset_root}")

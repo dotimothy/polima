@@ -10,9 +10,11 @@
 #include <sima_lmm/mla_buffer.hpp>
 #include <sima_lmm/mla_model.hpp>
 
+#include <algorithm>
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -102,6 +104,100 @@ class Runner {
   llima::MLABuffer input_;
   llima::MLABuffer output_;
   llima::MLAModelWithBuffer model_;
+};
+
+struct SharedStage {
+  std::string name;
+  std::filesystem::path elf;
+  size_t input_elements = 0;
+  size_t output_elements = 0;
+};
+
+// A linear sequence of HWC-compiled ELFs with device-resident intermediates.
+// Only the first input is uploaded and only the final output is downloaded.
+// Intermediate stages alternate between two MLABuffers, matching the
+// ping-pong arrangement validated for GR00T EAGLE on ModaliX.
+class SharedRunnerChain {
+ public:
+  SharedRunnerChain(std::string name, const std::vector<SharedStage>& stages,
+                    DramLayout output_layout = DramLayout::Plain,
+                    size_t logical_width = 0, size_t logical_channels = 0)
+      : name_(std::move(name)), output_layout_(output_layout),
+        logical_width_(logical_width), logical_channels_(logical_channels) {
+    if (stages.size() < 2)
+      throw std::runtime_error(name_ + " shared chain needs at least two stages");
+    input_elements_ = stages.front().input_elements;
+    output_elements_ = stages.back().output_elements;
+    const size_t shared_elements = stages.front().output_elements;
+    for (size_t index = 1; index < stages.size(); ++index) {
+      if (stages[index].input_elements != shared_elements ||
+          stages[index].output_elements != shared_elements)
+        throw std::runtime_error(name_ + " stage " + stages[index].name +
+                                 " does not match the shared buffer size");
+    }
+    if (output_elements_ != shared_elements)
+      throw std::runtime_error(name_ + " final output does not match its shared buffer");
+
+    staged_input_.resize(input_elements_);
+    staged_output_.resize(output_elements_);
+    input_ = std::make_unique<DeviceBuffer>(name_ + "_ifm", input_elements_);
+    ping_ = std::make_unique<DeviceBuffer>(name_ + "_ping", shared_elements);
+    pong_ = std::make_unique<DeviceBuffer>(name_ + "_pong", shared_elements);
+    for (size_t index = 0; index < stages.size(); ++index) {
+      auto* source = index == 0 ? input_.get() : (index % 2 ? ping_.get() : pong_.get());
+      auto* destination = index % 2 ? pong_.get() : ping_.get();
+      models_.push_back(std::make_unique<llima::MLAModelWithBuffer>(
+          stages[index].elf, std::vector<llima::MLABufferSlice>{llima::MLABufferSlice(&source->storage)},
+          std::vector<llima::MLABufferSlice>{llima::MLABufferSlice(&destination->storage)}));
+      models_.back()->load();
+    }
+    final_ = stages.size() % 2 ? ping_.get() : pong_.get();
+  }
+
+  ~SharedRunnerChain() {
+    for (auto& model : models_) model->free();
+    models_.clear();
+  }
+
+  SharedRunnerChain(const SharedRunnerChain&) = delete;
+  SharedRunnerChain& operator=(const SharedRunnerChain&) = delete;
+
+  void run(const float* input, float* output) {
+    to_bf16_span(input, staged_input_.data(), input_elements_);
+    input_->storage.upload(staged_input_.data());
+    for (auto& model : models_) model->run();
+    final_->storage.download(staged_output_.data());
+    detessellate(output_layout_, staged_output_.data(), output_elements_, logical_width_,
+                 logical_channels_, output);
+  }
+
+  size_t input_elements() const { return input_elements_; }
+  size_t output_elements() const { return output_elements_; }
+
+ private:
+  struct DeviceBuffer {
+    DeviceBuffer(const std::string& name, size_t elements)
+        : storage(name, {1, elements}, "bfloat16", false) {
+      storage.allocate();
+      storage.clear();
+    }
+    ~DeviceBuffer() { storage.free(); }
+    llima::MLABuffer storage;
+  };
+
+  std::string name_;
+  size_t input_elements_ = 0;
+  size_t output_elements_ = 0;
+  DramLayout output_layout_;
+  size_t logical_width_;
+  size_t logical_channels_;
+  std::vector<uint16_t> staged_input_;
+  std::vector<uint16_t> staged_output_;
+  std::unique_ptr<DeviceBuffer> input_;
+  std::unique_ptr<DeviceBuffer> ping_;
+  std::unique_ptr<DeviceBuffer> pong_;
+  DeviceBuffer* final_ = nullptr;
+  std::vector<std::unique_ptr<llima::MLAModelWithBuffer>> models_;
 };
 
 }  // namespace polima

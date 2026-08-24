@@ -1,11 +1,14 @@
 SHELL := /bin/bash
 REPO_ROOT := $(shell cd .. && pwd)
 MANIFEST  := tests/fixtures/legacy_manifest.txt
+VENV_PYTHON ?= $(shell command -v python3.12 2>/dev/null || command -v python3)
+LEROBOT_SOURCE ?= ../ACT/lerobot
 
 .PHONY: help
 help:
 	@echo "PoLiMa - policy framework for SiMa Modalix"
 	@echo ""
+	@echo "  make venv                 create/update the dedicated .venv"
 	@echo "  make install              editable install into the current env"
 	@echo "  make test                 unit tests"
 	@echo "  make doctor               environment diagnosis"
@@ -20,17 +23,30 @@ help:
 install:
 	pip install -e ".[dev]"
 
+.PHONY: venv
+venv:
+	@test -x .venv/bin/python || $(VENV_PYTHON) -m venv .venv
+	.venv/bin/python -m pip install --upgrade pip
+	.venv/bin/python -m pip install --index-url https://download.pytorch.org/whl/cpu \
+		'torch==2.3.1+cpu' 'torchvision==0.18.1+cpu'
+	.venv/bin/python -m pip install -c constraints-host.txt -e ".[host,dev]"
+	.venv/bin/python scripts/install_lerobot_compat.py \
+		"$(LEROBOT_SOURCE)" constraints-host.txt
+	@echo "PoLiMa CPU-only venv ready: $$(.venv/bin/python --version) at $$(pwd)/.venv"
+
 .PHONY: test
 test:
-	pytest -q tests/unit
+	@test -x .venv/bin/pytest || { echo "run 'make venv' first" >&2; exit 2; }
+	.venv/bin/pytest -q tests/unit
 
 .PHONY: doctor
 doctor:
-	polima doctor
+	./bin/polima doctor
 
 .PHONY: lint
 lint:
-	ruff check src tests
+	@test -x .venv/bin/ruff || { echo "run 'make venv' first" >&2; exit 2; }
+	.venv/bin/ruff check src tests
 
 # The Phase-1 regression gate. Until `git init` lands in Phase 2 this manifest is
 # the only proof that PoLiMa has not touched ACT/, SmolVLA/, GR00T-N1.6/ or

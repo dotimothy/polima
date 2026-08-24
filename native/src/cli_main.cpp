@@ -9,7 +9,10 @@
 //              --input-dir <bundle>/fixtures/inputs \
 //              --output /tmp/actions.f32 [--dump-stages /tmp/stages]
 
+#include <algorithm>
+#include <cerrno>
 #include <chrono>
+#include <cstring>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
@@ -17,15 +20,341 @@
 #include <string>
 #include <vector>
 
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+
 #include "polima/plan.hpp"
 #include "polima/repl.hpp"
+#include "polima/robot.hpp"
+#include "polima/service.hpp"
 #include "polima/sidecar.hpp"
 #include "polima/socket.hpp"
 
 namespace fs = std::filesystem;
 
+namespace {
+
+bool confirm(const std::string& question) {
+  std::cout << question << " [y/N] " << std::flush;
+  std::string answer;
+  if (!std::getline(std::cin, answer)) return false;
+  return !answer.empty() && (answer[0] == 'y' || answer[0] == 'Y');
+}
+
+fs::path root_path() {
+  const char* value = std::getenv("POLIMA_ROOT");
+  return value ? fs::path(value) : fs::path("/media/nvme/polima");
+}
+
+int run_python_command(const std::string& command, int argc, char** argv) {
+  const char* configured = std::getenv("LEROBOT_VENV");
+  const fs::path python =
+      (configured ? fs::path(configured) : fs::path("/media/nvme/lerobot")) / "bin/python";
+  if (!fs::exists(python))
+    throw std::runtime_error("PoLiMa's Python commands need the LeRobot environment at " +
+                             python.string());
+
+  std::vector<std::string> values = {
+      python.string(), "-m", "polima.cli.main", command};
+  for (int index = 2; index < argc; ++index) values.emplace_back(argv[index]);
+  std::vector<char*> child_argv;
+  child_argv.reserve(values.size() + 1);
+  for (auto& value : values) child_argv.push_back(value.data());
+  child_argv.push_back(nullptr);
+  ::execv(python.c_str(), child_argv.data());
+  throw std::runtime_error("could not launch PoLiMa Python CLI: " +
+                           std::string(std::strerror(errno)));
+}
+
+int acquire_control_lock(const fs::path& root) {
+  fs::create_directories(root / "var/run");
+  const fs::path path = root / "var/run/control.lock";
+  const int fd = ::open(path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0660);
+  if (fd < 0 || ::flock(fd, LOCK_EX | LOCK_NB) < 0) {
+    if (fd >= 0) ::close(fd);
+    throw std::runtime_error(
+        "another PoLiMa controller is active; stop it before changing device state");
+  }
+  return fd;
+}
+
+polima::CameraAssignment camera_assignment(const polima::RobotDescription& description,
+                                           const polima::Args& args) {
+  auto result = polima::assign_cameras(description, polima::list_cameras());
+  for (const auto& [role, label] : description.roles) {
+    (void)label;
+    const std::string option = "--" + role + "-camera";
+    if (args.has(option)) result.assigned[role] = args.get(option);
+  }
+  return result;
+}
+
+void print_robot(const polima::RobotDescription& description,
+                 const polima::CameraAssignment& assignment,
+                 const std::vector<std::string>& ports) {
+  std::cout << "arm\n";
+  if (ports.empty()) std::cout << "  none (expected a serial/by-id or ttyACM device)\n";
+  for (const auto& port : ports) std::cout << "  " << port << "\n";
+  std::cout << "cameras\n";
+  for (const auto& [role, label] : description.roles) {
+    const auto found = assignment.assigned.find(role);
+    std::cout << "  " << role << " (" << label << ")  "
+              << (found == assignment.assigned.end() ? "unassigned" : found->second) << "\n";
+  }
+  for (const auto& problem : assignment.problems) std::cout << "  ! " << problem << "\n";
+}
+
+std::string prompt_bundle(const fs::path& store) {
+  const auto entries = polima::scan_store(store);
+  if (entries.empty()) {
+    std::cout << "no bundles in " << store << "\n";
+    return "";
+  }
+  std::cout << "Installed bundles:\n";
+  for (size_t index = 0; index < entries.size(); ++index) {
+    const auto& entry = entries[index];
+    std::cout << "  " << index + 1 << ") " << entry.name;
+    if (!entry.policy.empty()) std::cout << " (" << entry.policy << ")";
+    if (!entry.managed) std::cout << " [legacy]";
+    if (entry.current) std::cout << " <- current";
+    std::cout << "\n";
+  }
+  std::cout << "Select a bundle by number or name (blank cancels): " << std::flush;
+  std::string selection;
+  if (!std::getline(std::cin, selection)) return "";
+  return selection;
+}
+
+int device_command(int argc, char** argv, const polima::Args& args) {
+  if (argc < 2) return -1;
+  const std::string command = argv[1];
+  if (command != "server" && command != "robot" && command != "activate") return -1;
+
+  std::string action = argc >= 3 && argv[2][0] != '-' ? argv[2] : "";
+  const bool interactive = ::isatty(STDIN_FILENO) && ::isatty(STDOUT_FILENO);
+  const fs::path root = root_path();
+  fs::path bundle = args.get("--bundle", (root / "current").string());
+
+  if (command == "activate") {
+    [[maybe_unused]] const int control_lock = acquire_control_lock(root);
+    const fs::path store = args.get("--models-dir", (root / "models").string());
+    std::string selection = action;
+    const bool guided = selection.empty();
+    if (selection.empty()) {
+      if (!interactive)
+        throw std::runtime_error("usage: polima activate <n|bundle-id>");
+      selection = prompt_bundle(store);
+      if (selection.empty()) {
+        std::cout << "nothing changed\n";
+        return 0;
+      }
+    }
+
+    const std::string selected = polima::resolve_bundle(store, selection);
+    const auto state = polima::server_state(root);
+    if (state.running) {
+      if (interactive && !args.has("--yes") &&
+          !confirm("Stop the running policy server and activate the new bundle?")) {
+        std::cout << "nothing changed\n";
+        return 0;
+      }
+      polima::stop_server(root);
+      std::cout << "stopped policy server\n";
+    }
+    const std::string active = polima::activate_bundle(store, selected);
+    std::cout << "current -> " << active << "\n";
+    const bool start = args.has("--start") ||
+                       (guided && confirm("Start the selected bundle's policy server now?"));
+    if (start) {
+      const fs::path active_bundle = store / active;
+      const auto description = polima::read_robot_description(active_bundle);
+      const int port = args.get_int("--port", description.default_port);
+      if (port <= 0)
+        throw std::runtime_error("bundle declares no server port; pass --port N");
+      const int pid = polima::start_server(root, root / "current", port);
+      if (!pid)
+        throw std::runtime_error("server failed to start; see var/log/server.log");
+      std::cout << "started pid=" << pid << " port=" << port << " bundle=" << active << "\n";
+    }
+    return 0;
+  }
+
+  if (command == "server") {
+    const auto state = polima::server_state(root);
+    if (action.empty()) {
+      std::cout << (state.running ? "running pid=" + std::to_string(state.pid) : "not running")
+                << " current=" << (state.bundle.empty() ? "-" : state.bundle) << "\n";
+      if (!interactive) return state.running ? 0 : 1;
+      if (state.running) {
+        if (!confirm("Stop the policy server?")) {
+          std::cout << "nothing changed\n";
+          return 0;
+        }
+        action = "stop";
+      } else {
+        if (!confirm("Start the active bundle's policy server?")) {
+          std::cout << "nothing changed\n";
+          return 0;
+        }
+        action = "start";
+      }
+    }
+    if (action == "status") {
+      std::cout << (state.running ? "running pid=" + std::to_string(state.pid) : "not running")
+                << " current=" << (state.bundle.empty() ? "-" : state.bundle) << "\n";
+      return state.running ? 0 : 1;
+    }
+    if (action == "stop") {
+      [[maybe_unused]] const int control_lock = acquire_control_lock(root);
+      std::cout << (polima::stop_server(root) ? "stopped\n" : "not running\n");
+      return 0;
+    }
+    if (action == "start") {
+      [[maybe_unused]] const int control_lock = acquire_control_lock(root);
+      if (!args.has("--bundle")) {
+        const fs::path store = args.get("--models-dir", (root / "models").string());
+        const auto entries = polima::scan_store(store);
+        const bool active = std::any_of(entries.begin(), entries.end(),
+                                        [](const polima::StoreEntry& entry) {
+                                          return entry.managed && entry.current;
+                                        });
+        if (!active) {
+          if (!interactive)
+            throw std::runtime_error(
+                "no active bundle; run `polima activate <n|bundle-id>` first");
+          std::cout << "No PoLiMa bundle is active. Choose one before starting the server.\n";
+          const std::string selection = prompt_bundle(store);
+          if (selection.empty()) {
+            std::cout << "nothing started\n";
+            return 0;
+          }
+          const std::string active_bundle = polima::activate_bundle(store, selection);
+          std::cout << "current -> " << active_bundle << "\n";
+        }
+        bundle = root / "current";
+      }
+      const auto description = polima::read_robot_description(bundle);
+      const int port = args.get_int("--port", description.default_port);
+      if (port <= 0) throw std::runtime_error("bundle declares no server port");
+      if (state.running) polima::stop_server(root);
+      const int pid = polima::start_server(root, bundle, port);
+      if (!pid) throw std::runtime_error("server failed to start; see var/log/server.log");
+      std::cout << "started pid=" << pid << " port=" << port << " bundle="
+                << fs::weakly_canonical(bundle).filename().string() << "\n";
+      return 0;
+    }
+    throw std::runtime_error("usage: polima server [status|start|stop]");
+  }
+
+  auto description = polima::read_robot_description(bundle);
+  if (!description.present)
+    throw std::runtime_error("bundle has no robot description; repack it with polima compile");
+  auto assignment = camera_assignment(description, args);
+  const auto ports = polima::list_serial_ports();
+  if (action.empty() || action == "status" || action == "doctor") {
+    std::cout << "bundle\n  " << fs::weakly_canonical(bundle).filename().string()
+              << " (port " << description.default_port << ")\n";
+    print_robot(description, assignment, ports);
+    const fs::path python = args.get("--lerobot-venv", "/media/nvme/lerobot") + "/bin/python";
+    std::cout << "lerobot\n  " << (fs::exists(python) ? python.string() : "missing") << "\n";
+    if (!action.empty() || !interactive) return 0;
+    if (ports.size() != 1) {
+      std::cout << "not ready: connect exactly one follower arm, or use "
+                   "--robot-port with `polima robot run`\n";
+      return 1;
+    }
+    for (const auto& [role, label] : description.roles) {
+      (void)label;
+      if (!assignment.assigned.count(role)) {
+        std::cout << "not ready: assign camera " << role << "\n";
+        return 1;
+      }
+    }
+    if (!confirm("Start the policy server and robot client? The follower arm may move")) {
+      std::cout << "nothing started\n";
+      return 0;
+    }
+    action = "run";
+  }
+  if (action == "preview") {
+    [[maybe_unused]] const int control_lock = acquire_control_lock(root);
+    for (const auto& [role, label] : description.roles) {
+      (void)label;
+      if (!assignment.assigned.count(role))
+        throw std::runtime_error("camera " + role + " is unassigned; pass --" + role + "-camera");
+      if (!fs::exists(assignment.assigned.at(role)))
+        throw std::runtime_error("camera " + role + " not found at " + assignment.assigned.at(role));
+    }
+    print_robot(description, assignment, {});
+    std::cout << "Starting camera-only preview. No policy server or follower arm will be started.\n";
+    const fs::path venv = args.get("--lerobot-venv", "/media/nvme/lerobot");
+    return polima::run_camera_preview(
+        bundle, assignment, args.get_int("--preview-port", 5001), venv);
+  }
+  if (action != "run" && action != "start")
+    throw std::runtime_error("usage: polima robot [status|preview|run]");
+
+  if (args.has("--fps")) description.fps = args.get_int("--fps", description.fps);
+  if (args.has("--actions-per-chunk"))
+    description.actions_per_chunk =
+        args.get_int("--actions-per-chunk", description.actions_per_chunk);
+  if (args.has("--max-relative-target"))
+    description.max_relative_target =
+        args.get_int("--max-relative-target", description.max_relative_target);
+  [[maybe_unused]] const int control_lock = acquire_control_lock(root);
+
+  std::string robot_port = args.get("--robot-port", "");
+  if (robot_port.empty()) {
+    if (ports.size() != 1)
+      throw std::runtime_error("select one follower arm with --robot-port");
+    robot_port = ports.front();
+  }
+  if (!fs::exists(robot_port))
+    throw std::runtime_error("follower arm not found at " + robot_port);
+  for (const auto& [role, label] : description.roles) {
+    (void)label;
+    if (!assignment.assigned.count(role))
+      throw std::runtime_error("camera " + role + " is unassigned; pass --" + role + "-camera");
+    if (!fs::exists(assignment.assigned.at(role)))
+      throw std::runtime_error("camera " + role + " not found at " + assignment.assigned.at(role));
+  }
+
+  const int port = args.get_int("--port", description.default_port);
+  if (port <= 0) throw std::runtime_error("bundle declares no server port");
+  if (!args.has("--yes") && !action.empty()) {
+    if (!interactive)
+      throw std::runtime_error("robot control needs confirmation; pass --yes for non-interactive use");
+    // A bare `polima robot` already confirmed immediately above.
+    if (argc >= 3 && !confirm(
+            "Start the policy server and robot client? The follower arm may move")) {
+      std::cout << "nothing started\n";
+      return 0;
+    }
+  }
+  if (polima::server_state(root).running) polima::stop_server(root);
+  const int server_pid = polima::start_server(root, bundle, port);
+  if (!server_pid) throw std::runtime_error("server failed to start; see var/log/server.log");
+
+  std::cout << "server pid=" << server_pid << " port=" << port << "\n";
+  print_robot(description, assignment, {robot_port});
+  std::cout << "Starting the robot client in the foreground. Ctrl-C stops robot control; "
+               "the policy server remains running.\n";
+  const fs::path venv = args.get("--lerobot-venv", "/media/nvme/lerobot");
+  return polima::run_robot_client(bundle, description, robot_port, assignment,
+                                  "127.0.0.1:" + std::to_string(port), venv);
+}
+
+}  // namespace
+
 int main(int argc, char** argv) {
   try {
+    if (argc >= 2) {
+      const std::string command = argv[1];
+      if (command == "studio" || command == "help")
+        return run_python_command(command, argc, argv);
+    }
+
     polima::Args args(argc, argv);
     if (args.has("--help") || args.has("-h")) {
       std::cout <<
@@ -38,18 +367,36 @@ int main(int argc, char** argv) {
         "  --verbose           per-step timings\n"
         "  --models-dir DIR    the board's model store\n"
         "                      (default: $POLIMA_ROOT/models or /media/nvme/polima/models)\n"
-        "  -h, --help          this message\n"
+        "  -h, --help          this message\n\n"
+        "Device lifecycle:\n"
+        "  polima activate [n|bundle-id] [--start] [--port N] [--models-dir DIR]\n"
+        "  polima server status|start|stop [--bundle DIR] [--port N]\n"
+        "  polima studio [status|start|stop|restart|enable|disable|logs|open|serve]\n"
+        "  polima robot [status|preview|run] [--bundle DIR] [--robot-port PATH] [--yes]\n"
+        "                         [--overhead-camera PATH --wrist-camera PATH]\n"
+        "                         [--preview-port N]\n"
+        "                         [--fps N --actions-per-chunk N --max-relative-target DEG]\n"
         "\nWith no --bundle it opens an interactive session over the model\n"
         "store: the model loads once and every command after that is fast.\n";
       return 0;
     }
 
+    const int controlled = device_command(argc, argv, args);
+    if (controlled >= 0) return controlled;
+
+    // Studio uses this for fixture benchmarks. Holding the same advisory lock
+    // as robot/preview commands makes a benchmark mutually exclusive with all
+    // device control, including a manually-started terminal client.
+    [[maybe_unused]] const int exclusive_control =
+        args.has("--exclusive-control") ? acquire_control_lock(root_path()) : -1;
+    if (args.has("--exclusive-control") && polima::server_state(root_path()).running)
+      throw std::runtime_error("stop the policy server before running an exclusive benchmark");
+
     // No bundle named -> interactive, the way `llima run` hands you a session
     // rather than exiting after one answer. `--bundle` keeps the one-shot path,
     // which scripts and the deploy smoke test depend on.
-    const char* env_root = std::getenv("POLIMA_ROOT");
     const fs::path store = args.get(
-        "--models-dir", (fs::path(env_root ? env_root : "/media/nvme/polima") / "models").string());
+        "--models-dir", (root_path() / "models").string());
     if (!args.has("--bundle") || args.has("--interactive"))
       return polima::repl(store, args.get("--bundle", ""), args.has("--verbose"));
     const fs::path bundle = args.get("--bundle");

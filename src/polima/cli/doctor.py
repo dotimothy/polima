@@ -17,11 +17,19 @@ late and confusingly. Each check below corresponds to one of them:
     churn, burying 3 real source edits. Doctor suppresses that noise.
   * `$HOME/MLSandbox` is a load-bearing symlink: ACT/lerobot's git remote points
     at its own sibling through it.
+
+Which checks run is decided by the platform, not by flags. Every landmine above
+is a *host* landmine, and a board has none of them -- no MLSandbox checkout, no
+lerobot clones, no compiler venv, no /ml_datasets -- so running them on a SoM
+reported one FAIL and five warnings that no board action could clear, and the
+exit code stopped meaning anything there. `role.detect()` decides; `--all`
+overrides it.
 """
 
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import shutil
@@ -72,6 +80,13 @@ OPTIONAL_SKILLS = (
 LEROBOT_CLONES = ("ACT/lerobot", "SmolVLA/lerobot")
 PINNED_LEROBOT_SHA = "36b8face988669509272b00f4abe6592d0b17aa0"
 
+#: Sections that inspect the build host's own workspace. None of them can pass on
+#: a SoM: the board gets a source sync and a venv, not the MLSandbox checkout,
+#: the legacy lerobot clones, the SiMa compiler venv or /ml_datasets. Running
+#: them there produced one FAIL and five warnings that no board action can fix,
+#: which made the exit code useless on exactly the machine that needs it.
+HOST_ONLY_SECTIONS = ("repository", "lerobot clones", "model compiler", "datasets")
+
 
 class Doctor:
     def __init__(self, *, json_output: bool = False) -> None:
@@ -98,6 +113,8 @@ def run(argv: list[str], parent: argparse.Namespace | None = None) -> int:
     parser.add_argument("--board", action="store_true", help="only the board checks")
     parser.add_argument("--imports", action="store_true", help="only the import matrix")
     parser.add_argument("--no-board", action="store_true", help="skip board reachability")
+    parser.add_argument("--all", action="store_true",
+                        help="run every section, including ones this machine's role skips")
     args = parser.parse_args(argv)
 
     config = load(config_file=getattr(parent, "config", None))
@@ -105,19 +122,38 @@ def run(argv: list[str], parent: argparse.Namespace | None = None) -> int:
     only_board, only_imports = args.board, args.imports
     everything = not (only_board or only_imports)
 
+    from polima import role
+
+    capabilities = role.detect()
+    # A board runs the host-only sections only when explicitly asked. The role,
+    # not the flag, is the default: `polima-doctor` should be clean on a healthy
+    # SoM without anyone having to know which flags to pass.
+    on_board = capabilities.role == role.BOARD
+    host_side = args.all or not on_board
+
     if everything:
         check_role(doc)
-        check_host(doc)
-        check_repo(doc)
+        check_host(doc, host_side)
+        if host_side:
+            check_repo(doc)
     if everything or only_imports:
         check_import_matrix(doc, config)
     if everything:
-        check_lerobot_patches(doc)
-        check_compiler(doc, config)
+        if host_side:
+            check_lerobot_patches(doc)
+            check_compiler(doc, config)
         check_policies(doc)
-        check_datasets(doc, config)
-    if (everything and not args.no_board) or only_board:
+        if host_side:
+            check_datasets(doc, config)
+        else:
+            skip_host_sections(doc, capabilities)
+    # On the board, probe this machine directly; ssh'ing to the configured board
+    # from the board itself would either loop back or fail on a key it need not
+    # have. An explicit `--board` still means "do the remote probe".
+    if only_board:
         check_board(doc, config)
+    elif everything and not args.no_board:
+        check_board(doc, config, local=on_board)
 
     if args.json:
         print(json.dumps({"status": doc.worst, "checks": doc.results}, indent=2))
@@ -165,8 +201,23 @@ def check_role(doc: Doctor) -> None:
         )
 
 
-def check_host(doc: Doctor) -> None:
-    doc.heading("host")
+def skip_host_sections(doc: Doctor, capabilities) -> None:
+    """Say what was skipped and why, rather than silently shrinking the report."""
+    doc.heading("host-only checks")
+    doc.record(
+        table.SKIP, ", ".join(HOST_ONLY_SECTIONS),
+        f"not applicable on this {capabilities.machine} board "
+        f"-- pass --all to run them anyway",
+    )
+
+
+def check_host(doc: Doctor, host_side: bool = True) -> None:
+    """The running interpreter, on either platform.
+
+    Python and numpy are the dependency floor everywhere. A host venv also owns
+    the full export stack; only AFE is supplied by an external extension.
+    """
+    doc.heading("interpreter")
     doc.record(table.OK, "python", f"{sys.version.split()[0]} at {sys.executable}")
     try:
         import numpy
@@ -175,20 +226,13 @@ def check_host(doc: Doctor) -> None:
     except ImportError:
         doc.record(table.FAIL, "numpy", "missing -- polima's only hard dependency")
 
-    conda = shutil.which("conda")
-    doc.record(table.OK if conda else table.WARN, "conda", conda or "not on PATH")
-    if conda:
-        listing = _capture([conda, "env", "list"])
-        names = {
-            line.split()[0]
-            for line in listing.splitlines()
-            if line.strip() and not line.startswith("#")
-        }
-        for env in ("act", "vla", "groot-n1.6", "groot-n1.6-convert"):
+    if host_side:
+        for module in ("torch", "lerobot", "onnx", "onnxruntime", "pyarrow"):
+            present = importlib.util.find_spec(module) is not None
             doc.record(
-                table.OK if env in names else table.WARN,
-                f"conda env {env}",
-                "present" if env in names else "absent",
+                table.OK if present else table.WARN,
+                f"host dependency {module}",
+                "installed in current environment" if present else "missing; run `make venv`",
             )
 
 
@@ -316,10 +360,6 @@ def check_import_matrix(doc: Doctor, config) -> None:
     compiler_bin = _find_compiler_bin(config)
     if compiler_bin:
         interpreters["model-compiler"] = str(Path(compiler_bin) / "python")
-    for env in ("act",):
-        candidate = _conda_python(env)
-        if candidate:
-            interpreters[f"conda:{env}"] = candidate
 
     source_root = str(Path(__file__).resolve().parents[2])
     snippet = (
@@ -472,9 +512,10 @@ def check_datasets(doc: Doctor, config) -> None:
 # ------------------------------------------------------------------- board
 
 
-def check_board(doc: Doctor, config) -> None:
+def check_board(doc: Doctor, config, *, local: bool = False) -> None:
+    """Probe the board -- over ssh from a host, directly when this IS the board."""
     board = config.board
-    doc.heading(f"board {board.host}")
+    doc.heading("board (this machine)" if local else f"board {board.host}")
     probe = (
         "echo VER=$(uname -m); "
         "echo CORES=$(nproc); "
@@ -485,15 +526,17 @@ def check_board(doc: Doctor, config) -> None:
         "echo JSON=$(ls /usr/include/nlohmann/json.hpp 2>/dev/null); "
         f"echo POLIMA=$(ls -d {board.root} 2>/dev/null)"
     )
-    result = subprocess.run(
-        ["ssh", *board.ssh_options, "-o", f"ConnectTimeout={int(board.connect_timeout_s)}",
-         board.host, probe],
-        capture_output=True, text=True,
+    argv = (
+        ["sh", "-c", probe] if local
+        else ["ssh", *board.ssh_options, "-o", f"ConnectTimeout={int(board.connect_timeout_s)}",
+              board.host, probe]
     )
+    result = subprocess.run(argv, capture_output=True, text=True)
     if result.returncode != 0:
         doc.record(
             table.WARN, "reachable",
-            f"ssh failed: {result.stderr.strip().splitlines()[-1] if result.stderr else 'no output'}",
+            f"{'probe' if local else 'ssh'} failed: "
+            f"{result.stderr.strip().splitlines()[-1] if result.stderr else 'no output'}",
         )
         return
 
@@ -503,7 +546,8 @@ def check_board(doc: Doctor, config) -> None:
     arch = facts.get("VER", "")
     doc.record(
         table.OK if arch == "aarch64" else table.FAIL,
-        "reachable", f"{arch}, {facts.get('CORES', '?')} cores",
+        "this machine" if local else "reachable",
+        f"{arch}, {facts.get('CORES', '?')} cores",
     )
     free = facts.get("FREE", "")
     doc.record(table.OK if free else table.WARN, "free space", f"{free}G on /media/nvme")

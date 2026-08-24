@@ -32,6 +32,16 @@ struct StoreEntry {
 // they carry no plan.json -- the listing says so rather than failing later.
 std::vector<StoreEntry> scan_store(const std::filesystem::path& store);
 
+// Resolve a one-based list index or exact bundle name, rejecting unmanaged
+// legacy trees without changing device state.
+std::string resolve_bundle(const std::filesystem::path& store,
+                           const std::string& selection);
+
+// Atomically point <store>/../current at a managed bundle selected by its
+// one-based list index or exact name. Returns the selected bundle name.
+std::string activate_bundle(const std::filesystem::path& store,
+                            const std::string& selection);
+
 // Run the interactive session. Returns a process exit code.
 int repl(const std::filesystem::path& store, const std::string& preselect, bool verbose);
 

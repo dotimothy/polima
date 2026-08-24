@@ -36,6 +36,9 @@ struct RobotDescription {
   std::string fourcc = "MJPG";
   std::string calibration_id;
   int fps = 30;
+  int default_port = 0;
+  int actions_per_chunk = 0;
+  int max_relative_target = 12;
 };
 
 struct CameraAssignment {
@@ -50,5 +53,22 @@ std::vector<std::string> list_serial_ports(const std::filesystem::path& dev = "/
 RobotDescription read_robot_description(const std::filesystem::path& bundle_root);
 CameraAssignment assign_cameras(const RobotDescription& description,
                                 const std::vector<CameraDevice>& cameras);
+
+// Serve both camera feeds in a browser without opening the follower arm or
+// starting the policy server. Runs in the foreground until Ctrl-C.
+int run_camera_preview(const std::filesystem::path& bundle_root,
+                       const CameraAssignment& cameras,
+                       int preview_port = 5001,
+                       const std::filesystem::path& venv = "/media/nvme/lerobot");
+
+// Run the bundle's proven LeRobot control client in the foreground. The
+// policy server remains a separate background process; Ctrl-C therefore stops
+// robot motion without tearing down the loaded model.
+int run_robot_client(const std::filesystem::path& bundle_root,
+                     const RobotDescription& description,
+                     const std::string& robot_port,
+                     const CameraAssignment& cameras,
+                     const std::string& server_address,
+                     const std::filesystem::path& venv = "/media/nvme/lerobot");
 
 }  // namespace polima

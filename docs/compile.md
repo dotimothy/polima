@@ -18,13 +18,17 @@ which become `polima/compile/driver.py` driven by `PolicySpec.compile.graphs`.
 
 The compiler is never imported, always subprocessed:
 
-    training env      torch + lerobot,  no afe
+    polima .venv      torch + lerobot,  no afe
     model-compiler    afe + onnx,       no torch
     board             numpy,            neither
 
 `polima compile` itself runs in the neutral middle and shells out. That is why
 `polima/compile/tensor.py` imports afe *inside* its functions -- the module has
 to be importable in all three, and `polima doctor --imports` proves it is.
+
+For `--checkpoint`, PoLiMa loads the policy and performs checkpoint-to-ONNX
+export directly in its self-contained `.venv`. It launches each ELF build under
+the permitted external ModelSDK extension. No Conda environment participates.
 
 The compiler venv has no polima installed, so the driver puts `src/` on its
 `PYTHONPATH` and runs `python -m polima.compile.tensor`.
@@ -203,3 +207,47 @@ consumes a fresh tree unchanged and a legacy tree stays importable:
     logs/compile_<name>_<precision>.log
     compile_state.json                     resume keys
     artifact_manifest.json
+
+## Device-resident ELF chains
+
+Token backbones such as GR00T EAGLE are exported as many consecutive ELFs. A
+normal `run_elf` step downloads and converts one graph's output, then converts
+and uploads it for the next graph. For a compatible linear section, declare the
+graphs with an explicit external HWC boundary:
+
+```python
+GraphSpec(
+    name="eagle_qwen_00_01",
+    inputs=(TensorSpec("hidden", (1, 116, 2048)),),
+    outputs=(TensorSpec("hidden_out", (1, 116, 2048)),),
+    layout="NHWC",
+    mla_tessellation=False,
+    external_dram_layout="HWC",
+    promote_rank3_hwc=True,
+    # ...
+)
+```
+
+`promote_rank3_hwc` adds numerical no-op boundary reshapes from `[N,W,C]` to
+`[N,1,W,C]`. ModelSDK 2.1 requires the rank-4 form when packaging an explicit
+HWC layout. The compile content key includes both fields, so an old ELF with a
+compiler-selected layout is never reused as a shared one.
+
+The runtime plan then replaces consecutive host-visible calls with one chain:
+
+```python
+Step(
+    "run_elf_chain",
+    "qwen_output",
+    {
+        "graphs": ["eagle_qwen_00_01", "eagle_qwen_02_03", "eagle_qwen_04_05"],
+        "in": ["qwen_input"],
+    },
+)
+```
+
+PoLiMa uploads `qwen_input` once, alternates the graph outputs between two
+MLABuffers, and downloads only `qwen_output`. Plan validation requires one
+input/output per graph, matching element counts at every edge, and `HWC` on all
+ELFs. Do not put the legacy compiler-layout ELFs in a chain: matching logical
+shapes do not imply matching physical byte-plane layouts.
