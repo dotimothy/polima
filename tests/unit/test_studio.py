@@ -261,6 +261,28 @@ def test_process_failure_exposes_actionable_recent_output() -> None:
     )
 
 
+def test_runtime_calibration_mismatch_stops_robot_and_guides_operator(tmp_path: Path) -> None:
+    command = tmp_path / "robot"
+    command.write_text(
+        "#!/bin/sh\n"
+        "echo 'Mismatch between calibration values in the motor and the calibration file or no calibration file found'\n"
+        "sleep 5\n"
+    )
+    command.chmod(0o755)
+    runtime = StudioRuntime(tmp_path)
+    runtime._spawn("robot", [str(command)], StudioState.RUNNING, tmp_path / "robot.log", {})
+
+    deadline = time.time() + 2
+    while runtime.state != StudioState.FAULT and time.time() < deadline:
+        time.sleep(0.01)
+
+    assert runtime.state == StudioState.FAULT
+    assert runtime.fault is not None
+    assert "Manual Calibration (c)" in runtime.fault
+    assert any(event.get("type") == "calibration" and event.get("action") == "required"
+               for event in runtime._events)
+
+
 def test_hardware_free_benchmark_is_supervised_and_persisted(tmp_path: Path) -> None:
     run = config(tmp_path)
     (tmp_path / "models/demo/fixtures/inputs").mkdir(parents=True)

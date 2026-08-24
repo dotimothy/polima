@@ -22,6 +22,11 @@ from .models import RunConfig, StudioState
 from .store import StudioStore
 
 _PREVIEW_RE = re.compile(r"(?:Camera preview server|Live camera server):\s+(https?://\S+)")
+_CALIBRATION_MISMATCH = re.compile(
+    r"mismatch between calibration values in the motor and the calibration file"
+    r"|no calibration file found",
+    re.IGNORECASE,
+)
 _BENCHMARK_RE = re.compile(
     r"min (?P<min>[\d.]+) / mean (?P<mean>[\d.]+) / median (?P<median>[\d.]+) "
     r"/ p95 (?P<p95>[\d.]+) / p99 (?P<p99>[\d.]+) / max (?P<max>[\d.]+) ms "
@@ -585,6 +590,22 @@ class StudioRuntime:
                     # completed.  Give browser clients a state-bearing event
                     # instead of making them infer readiness from log text.
                     self.emit("preview", url=preview_url)
+                if kind == "robot" and _CALIBRATION_MISMATCH.search(text):
+                    # LeRobot reports this after connecting to the follower.
+                    # Stop before it can accept a control command, and turn the
+                    # otherwise cryptic library warning into an operator action.
+                    fault = (
+                        "Follower-arm calibration is required. Open Follower calibration, "
+                        "then choose Use Existing (Enter) or Manual Calibration (c)."
+                    )
+                    with self._lock:
+                        if self._process is process:
+                            self._termination = "calibration_required"
+                            self.state = StudioState.FAULT
+                            self.fault = fault
+                    self.emit("calibration", action="required", fault=fault)
+                    self.emit("state", state=StudioState.FAULT.value, fault=fault)
+                    self._signal_process(signal.SIGINT)
                 self.emit("log", process=kind, line=text)
         code = process.wait()
         with self._lock:
@@ -593,16 +614,18 @@ class StudioRuntime:
                 self._kind = None
                 self.preview_url = None
                 expected_stop = self._termination in {"stopped", "halted"}
+                calibration_required = self._termination == "calibration_required"
                 self.state = (
-                    StudioState.IDLE
+                    StudioState.FAULT
+                    if calibration_required
+                    else StudioState.IDLE
                     if expected_stop or code in (0, 130, 143)
                     else StudioState.FAULT
                 )
-                self.fault = (
-                    None
-                    if self.state == StudioState.IDLE
-                    else process_failure(kind, code, recent)
-                )
+                if self.state == StudioState.IDLE:
+                    self.fault = None
+                elif not calibration_required:
+                    self.fault = process_failure(kind, code, recent)
         if run_id is not None:
             status = self._termination or ("completed" if code == 0 else "failed")
             self.store.finish_run(run_id, status, self.fault)
