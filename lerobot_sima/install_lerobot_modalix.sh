@@ -35,6 +35,9 @@ LEROBOT_VERSION="${LEROBOT_VERSION:-0.4.4}"
 # the incompatible system protobuf instead.
 WANDB_VERSION="${WANDB_VERSION:-0.24.2}"
 PROTOBUF_VERSION="${PROTOBUF_VERSION:-6.31.1}"
+# The asynchronous PoLiMa client connects to the on-device policy service over
+# gRPC. LeRobot 0.4.4 does not make grpcio a dependable base dependency.
+GRPCIO_VERSION="${GRPCIO_VERSION:-1.80.0}"
 PYTHON="${PYTHON:-python3}"
 
 log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
@@ -113,7 +116,8 @@ export PIP_DISABLE_PIP_VERSION_CHECK=1
 "$VENV/bin/python" -m pip install \
   "lerobot[$EXTRAS]==$LEROBOT_VERSION" \
   "wandb==$WANDB_VERSION" \
-  "protobuf==$PROTOBUF_VERSION"
+  "protobuf==$PROTOBUF_VERSION" \
+  "grpcio==$GRPCIO_VERSION"
 
 # The PoLiMa robot clients expose their already-captured camera observations as
 # a tokenized MJPEG page. Flask is intentionally installed in this standalone
@@ -145,6 +149,7 @@ print(f"    python  {sys.version.split()[0]} ({platform.machine()})")
 print(f"    lerobot {md.version('lerobot')}")
 import torch; print(f"    torch   {torch.__version__}")
 import flask; print(f"    flask  {md.version('flask')}")
+import grpc; print(f"    grpcio {md.version('grpcio')}")
 import google.protobuf.runtime_version
 print(f"    protobuf {md.version('protobuf')}")
 print(f"    wandb    {md.version('wandb')}")

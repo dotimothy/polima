@@ -28,13 +28,14 @@ fi
 
 if ! "$LEROBOT_VENV/bin/python" -c '
 import importlib.metadata as metadata
-import flask, waitress, google.protobuf.runtime_version
+import flask, grpc, waitress, google.protobuf.runtime_version
 assert metadata.version("protobuf") == "6.31.1"
 assert metadata.version("wandb") == "0.24.2"
+assert metadata.version("grpcio") == "1.80.0"
 ' >/dev/null 2>&1; then
-    log "Installing Studio dependencies and compatible protobuf runtime"
+    log "Installing Studio dependencies and compatible protobuf and gRPC runtimes"
     "$LEROBOT_VENV/bin/python" -m pip install \
-        flask waitress "wandb==0.24.2" "protobuf==6.31.1"
+        flask waitress "wandb==0.24.2" "protobuf==6.31.1" "grpcio==1.80.0"
 fi
 
 log "Installing the PoLiMa board package and Studio assets"
