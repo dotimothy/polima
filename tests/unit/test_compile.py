@@ -22,8 +22,10 @@ from polima.compile import calibration as calib
 from polima.compile import mpk
 from polima.compile.driver import Driver, GraphResult
 from polima.compile.tensor import (
+    MPK_FAILURE,
     build_parser,
     detect_io,
+    mpk_only_failure,
     promote_rank3_hwc,
 )
 from polima.policies.registry import get_policy
@@ -883,3 +885,32 @@ def test_a_compile_recompiles_by_default(monkeypatch, tmp_path, capsys):
     seen.clear()
     compile_cli.run(["--build-dir", str(tmp_path), "--stop-after", "compile", "--reuse"])
     assert seen["force"] is False
+
+
+# ------------------------------------------------------------ mpk tolerance
+
+
+def test_mpk_failure_with_a_finished_elf_is_tolerated(tmp_path):
+    elf = tmp_path / "graph_stage1_mla.elf"
+    elf.write_bytes(b"\x7fELF" + bytes(64))
+    error = RuntimeError(f"{MPK_FAILURE}.  See the log for details.")
+    assert mpk_only_failure(error, elf, settle_seconds=0.0)
+
+
+def test_mpk_failure_without_an_elf_still_fails(tmp_path):
+    error = RuntimeError(MPK_FAILURE)
+    assert not mpk_only_failure(error, tmp_path / "missing.elf", settle_seconds=0.0)
+    assert not mpk_only_failure(error, None, settle_seconds=0.0)
+
+
+def test_empty_elf_is_not_a_finished_elf(tmp_path):
+    elf = tmp_path / "graph_stage1_mla.elf"
+    elf.touch()
+    assert not mpk_only_failure(RuntimeError(MPK_FAILURE), elf, settle_seconds=0.0)
+
+
+def test_other_compile_errors_are_never_swallowed(tmp_path):
+    elf = tmp_path / "graph_stage1_mla.elf"
+    elf.write_bytes(b"\x7fELF" + bytes(64))
+    assert not mpk_only_failure(RuntimeError("TVMError: Assert fail"), elf,
+                                settle_seconds=0.0)

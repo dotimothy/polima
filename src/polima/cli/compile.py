@@ -300,7 +300,7 @@ def _export(args, spec, build_dir: Path, dry_run: bool) -> int:
         return 0
     verdict = "PASS" if report["ok"] else "FAIL"
     print(f"  verify    {verdict}  max_abs={report['max_abs']:.3e} "
-          f"mean_abs={report['mean_abs']:.3e} (atol={report['atol']})")
+          f"mean_abs={report['mean_abs']:.3e} (atol={report.get('atol', 'n/a')})")
     if not report["ok"]:
         print("\npolima-compile: the ONNX chain does not match PyTorch, so "
               "compiling it would bake in the error.\n"

@@ -86,6 +86,9 @@ struct Step {
   std::string bias;
   std::string mean;
   std::string std_dev;
+  bool clip = false;                 // normalize/denormalize: clamp into [clip_min, clip_max]
+  float clip_min = 0.0f;             //   normalize clamps its result, denormalize its input,
+  float clip_max = 0.0f;             //   which is where GR00T's min/max scaling clips
   size_t rows = 0;
   size_t cols = 0;
   size_t grid = 0;                   // pixel_unshuffle: input side, in tokens

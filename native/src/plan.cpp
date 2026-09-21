@@ -1,3 +1,4 @@
+#include <algorithm>
 #include "polima/plan.hpp"
 
 #include <chrono>
@@ -214,6 +215,11 @@ Plan::Plan(const std::filesystem::path& bundle_root, bool verbose)
     step.bias = args.value("bias", std::string{});
     step.mean = args.value("mean", std::string{});
     step.std_dev = args.value("std", std::string{});
+    if (args.contains("clip_min") || args.contains("clip_max")) {
+      step.clip = true;
+      step.clip_min = args.value("clip_min", -3.4e38f);
+      step.clip_max = args.value("clip_max", 3.4e38f);
+    }
     step.rows = args.value("rows", size_t{0});
     step.cols = args.value("cols", size_t{0});
 
@@ -444,9 +450,15 @@ void Plan::run_step(const Step& step) {
       const auto& deviation = sidecars_.get(step.std_dev);
       for (size_t index = 0; index < out.size(); ++index) {
         const size_t stat = index % mean.size();
-        out[index] = step.opcode == Opcode::Normalize
-                         ? (source[index] - mean[stat]) / deviation[stat]
-                         : source[index] * deviation[stat] + mean[stat];
+        if (step.opcode == Opcode::Normalize) {
+          const float value = (source[index] - mean[stat]) / deviation[stat];
+          out[index] = step.clip ? std::clamp(value, step.clip_min, step.clip_max) : value;
+        } else {
+          // GR00T clips the normalized value before scaling it back.
+          const float value = step.clip ? std::clamp(source[index], step.clip_min, step.clip_max)
+                                        : source[index];
+          out[index] = value * deviation[stat] + mean[stat];
+        }
       }
       break;
     }

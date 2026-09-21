@@ -200,11 +200,20 @@ class StubPlan:
             deviation = self._constant(args["std"])
             tiled_mean = np.resize(mean, values.size)
             tiled_std = np.resize(deviation, values.size)
-            state[step["out"]] = (
-                (values - tiled_mean) / tiled_std
-                if op == "normalize"
-                else values * tiled_std + tiled_mean
-            ).astype(np.float32)
+            # Optional clamp, mirroring plan.cpp: normalize clamps its result,
+            # denormalize its input -- where GR00T's min/max scaling clips.
+            clip = "clip_min" in args or "clip_max" in args
+            low = np.float32(args.get("clip_min", -np.inf))
+            high = np.float32(args.get("clip_max", np.inf))
+            if op == "normalize":
+                result = (values - tiled_mean) / tiled_std
+                if clip:
+                    result = np.clip(result, low, high)
+            else:
+                if clip:
+                    values = np.clip(values, low, high)
+                result = values * tiled_std + tiled_mean
+            state[step["out"]] = result.astype(np.float32)
 
         else:
             raise PlanError(f"unknown opcode {op!r}")

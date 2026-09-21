@@ -24,7 +24,7 @@ DEFAULT_BOARD_ROOT = "/media/nvme/polima"
 # Legacy servers currently occupy 8081 (smolvla_som_server) and 8082 (act_llima).
 # PoLiMa deploys default to the 809x band so both stacks can serve side by side
 # during the Phase-1 parity proof.
-DEFAULT_PORTS = {"act": 8092, "smolvla": 8091, "groot": 8093}
+DEFAULT_PORTS = {"act": 8092, "smolvla": 8091, "groot": 8093, "groot17": 8094}
 
 
 @dataclass

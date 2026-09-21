@@ -439,17 +439,49 @@ def main(argv: Sequence[str] | None = None) -> int:
         external_layout_parameters(quantized, args.external_dram_layout)
         if args.external_dram_layout != "compiler" else None
     )
-    quantized.compile(
-        output_path=str(output),
-        batch_size=args.batch_size,
-        log_level=logging.INFO,
-        tessellate_parameters=compile_layout,
-        retained_temporary_directory_name=(
-            str(args.retain_compile_dir) if args.retain_compile_dir else None
-        ),
-    )
+    try:
+        quantized.compile(
+            output_path=str(output),
+            batch_size=args.batch_size,
+            log_level=logging.INFO,
+            tessellate_parameters=compile_layout,
+            retained_temporary_directory_name=(
+                str(args.retain_compile_dir) if args.retain_compile_dir else None
+            ),
+        )
+    except Exception as error:  # re-raised below unless it is the MPK packager's
+        elf = (args.retain_compile_dir / f"{stem}_stage1_mla.elf"
+               if args.retain_compile_dir else None)
+        if not mpk_only_failure(error, elf):
+            raise
+        print(f"[WARN] MPK packaging failed after the ELF was written ({error}); "
+              f"keeping {elf}", flush=True)
+        return 0
     print("[INFO] Compilation complete")
     return 0
+
+
+#: ModelSDK 2.1's MPK packager (mpk_parser/seq.py) indexes a list of input
+#: names per buffer and runs off its end for tessellated graphs whose inputs
+#: differ in shape -- GR00T N1.7's DiT pairs and action projectors. It runs
+#: after code generation and the checker pass, so the retained ELF is complete;
+#: only the .tar.gz nobody here loads is missing.
+MPK_FAILURE = "Failed to process the MPK JSON file"
+
+
+def mpk_only_failure(error: BaseException, elf: Path | None,
+                     settle_seconds: float = 2.0) -> bool:
+    """True when `error` is the MPK packager's and a finished ELF is on disk."""
+    if MPK_FAILURE not in str(error) or elf is None:
+        return False
+    try:
+        before = elf.stat()
+        time.sleep(settle_seconds)
+        after = elf.stat()
+    except FileNotFoundError:
+        return False
+    return (before.st_size > 0 and before.st_size == after.st_size
+            and before.st_mtime_ns == after.st_mtime_ns)
 
 
 def _start_elf_watchdog(path: Path, stable_seconds: float = 30.0) -> None:
